@@ -1,34 +1,37 @@
+/*
+ * Copyright (C) 2026 Neil Rackett
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /**
  * File: emul.c
- * Description: Template microfirmware boot path. Brings up the cartridge
- *              bus emulator, the 32 KB color framebuffer, the ROM3
- *              command-capture ring, the SD card, and the SELECT
- *              button, then enters a tight main loop that drains the
- *              ROM3 ring into the IKBD demux and re-renders the
- *              framebuffer.
+ * Description: MD/MJPEG -- streams an MJPEG+PCM .AVI from the SD card
+ *              to the Atari ST screen at up to 25 fps with a per-frame
+ *              quantized 16-colour palette and YM2149 audio.
  *
- * The previous u8g2-backed terminal subsystem was stripped
- * (term.c, display.c, display_term.h). The cart-side UI is now driven
- * entirely by fb.c writing into the 32 KB low-res framebuffer at
- * $FA8300, which the m68k userfw VBL loop blits to ST screen each
- * frame. Apps extend this template by drawing into
- * `fb_screen.framebuffer` via fb_font / fb_blit.
+ * Boot block (cart bus, framebuffer, SD, SELECT) is the template's;
+ * the app is mjpeg.c / mjpeg_quant.c driven from the main loop. The
+ * first .AVI found in the app folder is played on loop; ESC exits to
+ * GEM (default ikbd.c behaviour).
  */
 
 #include "emul.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "aconfig.h"
 #include "audio.h"
-#include "audio_sample.h"
 #include "commemul.h"
 #include "debug.h"
-#include "demo.h"
 #include "fb.h"
+#include "fb_chunked.h"
+#include "fb_font.h"
 #include "ff.h"
 #include "ikbd.h"
 #include "memfunc.h"
+#include "mjpeg.h"
 #include "palette.h"
 #include "pico/stdlib.h"
 #include "romemul.h"
@@ -36,125 +39,170 @@
 #include "select.h"
 #include "target_firmware.h"
 
-/* No sleep -- tight loop. The dirty-frame handshake means
- * the m68k only blits cart->ST when fb_publish() actually advances
- * the frame counter. The RP can rewrite the framebuffer at whatever
- * rate it wants; the m68k decides per VBL whether the new content is
- * worth copying. Apps that need a fixed cadence can add their own
- * sleep_ms / sleep_until call here. */
+extern const struct FB_FONT font8x8; /* defined in fb.c */
+
+/* Cart-corruption canary: the first 16 bytes of the served cart region
+ * (the m68k cartridge header + entry) must stay byte-identical to the
+ * embedded image after COPY_FIRMWARE_TO_RAM. Any change means something
+ * on the RP wrote into the region the m68k is executing from -- which
+ * crashes the ST with bombs. Logs the first corruption with a stage
+ * tag so the culprit can be localized. */
+static bool cart_check(const char *stage) {
+  static bool ok = true;
+  if (ok &&
+      memcmp((const void *)&__rom_in_ram_start__, target_firmware, 16) != 0) {
+    ok = false;
+    const volatile uint16_t *c = (const volatile uint16_t *)&__rom_in_ram_start__;
+    DPRINTF("CART REGION CORRUPTED (%s): %04X %04X %04X %04X\n", stage, c[0],
+            c[1], c[2], c[3]);
+  }
+  return ok;
+}
+
+/* Centered status line on a black screen (used when there is nothing
+ * to play -- the video path never draws text). */
+static void show_status(const char *line1, const char *line2) {
+  fb_chunked_clear(15);
+  font_set_font(&font8x8);
+  font_set_color(0);
+  font_align(FONT_ALIGN_CENTER);
+  font_move(FB_CHUNKED_W / 2, 88);
+  font_print(line1);
+  if (line2) {
+    font_move(FB_CHUNKED_W / 2, 104);
+    font_print(line2);
+  }
+  font_align(FONT_ALIGN_LEFT);
+  fb_publish();
+}
 
 void emul_start() {
-  // RP2040 RAM is undefined at power-on; firmware.py only emits the
-  // bytes up to the last non-zero in BOOT.BIN (padded to 64 KB), so
-  // without an explicit erase the framebuffer region at $FA8300+ would
-  // be whatever was sitting in RAM and the m68k blit would copy that
-  // noise to the ST screen. Zero the whole 64 KB shared region first
-  // so every byte the m68k can see is deterministic.
-  ERASE_FIRMWARE_IN_RAM();
+  /* Heal the per-app FOLDER config before anything else (and before
+   * Core 1 launches, so the flash write is trivially safe). A stored
+   * value of "/test" is never legitimate for this app -- it's the
+   * upstream template's default leaking in from a recycled config
+   * sector -- and sdcard_initFilesystem() would otherwise create that
+   * junk folder on the card. Genuine custom folders are left alone. */
+  SettingsConfigEntry *folder =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
+  if (folder == NULL || strcmp(folder->value, "/test") == 0) {
+    DPRINTF("Healing FOLDER config ('%s') -> /mjpeg\n",
+            folder ? folder->value : "<missing>");
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/mjpeg");
+    settings_save(aconfig_getContext(), true);
+    folder = settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
+  }
+  static char folderName[SETTINGS_MAX_VALUE_LENGTH];
+  snprintf(folderName, sizeof(folderName), "%s",
+           folder ? folder->value : "/mjpeg");
 
-  // Copy the cartridge image into the now-zeroed region.
+  /* --- boot sequence (identical to the template's emul.c) --- */
+  ERASE_FIRMWARE_IN_RAM();
   COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
 
-  // Reset the IKBD ring (init order before commemul_init is fine since
-  // the producer side runs from the main loop, not from an IRQ).
   ikbd_init();
-
-  // Initialise the cartridge ROM4 read engine. ROM4 reads are served
-  // entirely by chained DMAs feeding the PIO TX FIFO -- no CPU/IRQ
-  // involvement. IKBD ingest is on ROM3 + commemul ring (see main
-  // loop below).
   if (init_romemul(false) < 0) {
-    panic("init_romemul failed: PIO/DMA claim or program load returned <0");
+    panic("init_romemul failed");
   }
-
-  // Bring up the ROM3 cart-bus capture (PIO + 32 KB DMA ring) BEFORE
-  // fb_init: fb_init's first fb_publish() drains the ROM3 ring while it
-  // waits for the m68k's VBL ack, so the ring must already exist. (At
-  // boot the m68k may not be emitting acks yet; the first publish just
-  // times out after ~33 ms and proceeds.) The main loop drains the
-  // ring via fb_pump_rom3() -> IKBD demux + VBL frame-sync.
   if (commemul_init() < 0) {
-    panic("commemul_init failed: PIO/DMA claim or program load returned <0");
+    panic("commemul_init failed");
   }
-
-  // Initialise the 32 KB low-res framebuffer (320x200, 4 bpp). Sets
-  // up `fb_screen` for the font/draw primitives, clears the FB to
-  // black (0xFF -> palette index 15 on the default TOS palette), and
-  // renders the boot pattern. The m68k VBL loop in userfw.s blits
-  // this to an off-screen ST page each frame and flips the video base.
   if (fb_init(&fb_mode_320x200) < 0) {
     panic("fb_init failed");
   }
-
-  // Publish the default 16-colour palette to the cart shared-region
-  // slot. The m68k VBL handler applies it to the shifter palette
-  // registers ($FFFF8240..) every frame. Apps that want a different
-  // palette call palette_set() / palette_set_entry() at any time;
-  // the next VBL picks it up.
   palette_init();
-
-  // Initialise the cart audio buffer producer (see audio.h). The
-  // m68k Timer-B IRQ in userfw.s consumes the buffer at ~5,585 Hz
-  // (2 B/sample dual-channel mode). audio_init() leaves the buffer
-  // silent until a callback is installed; the playback source is
-  // chosen below, after the SD card has had a chance to mount.
   audio_init();
 
-  // SD card -- best-effort. Apps that need persistent storage can
-  // ignore the failure path or treat it as fatal. The folder name is
-  // taken from per-app config (ACONFIG_PARAM_FOLDER) so apps can be
-  // reconfigured from Booster without recompiling.
   FATFS fsys;
-  SettingsConfigEntry *folder =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  const char *folderName = folder ? folder->value : "/test";
-  if (sdcard_initFilesystem(&fsys, folderName) != SDCARD_INIT_OK) {
-    DPRINTF("SD card unavailable. Continuing without SD.\n");
+  cart_check("pre-sd");
+  bool sd_ok = sdcard_initFilesystem(&fsys, folderName) == SDCARD_INIT_OK;
+  if (!sd_ok) {
+    DPRINTF("SD card unavailable.\n");
   }
+  cart_check("post-sd");
 
-  // Audio source selection. Try to stream a
-  // .YMS file from the app folder first; on any failure (no SD,
-  // file missing, bad header, rate mismatch) fall back to the
-  // baked-in Ghostbusters G1 jingle so the demo still has audio.
-  // Apps swap their own audio_play_yms_file path or replace this
-  // block with audio_set_fill_callback() / audio_play_loop().
-  if (audio_play_yms_file("DEMO.YMS") < 0) {
-    audio_play_loop(audio_sample_data,
-                    (uint32_t)sizeof(audio_sample_data));
-  }
-
-  // Cartridge SELECT button -- apps can poll select_isPressed().
   select_configure();
 
-  // Bring up the demo dispatcher. demo_dispatcher_init takes
-  // ownership of the ESC key from ikbd.c (ESC now means "back to
-  // menu" inside a demo and "exit to GEM" only when the menu is on
-  // screen). The first dispatcher render paints the boot menu over
-  // whatever fb_init left in the framebuffer.
-  demo_dispatcher_init();
+  /* --- find and open the first .AVI: app folder first, then root --- */
+  bool playing = false;
+  if (sd_ok) {
+    static char path[300];
+    static char msg[80];
+    /* Configured folder first, then the app's canonical folder, then
+     * the card root -- the config sector can hold a stale FOLDER (it
+     * is only as trustworthy as the last app that saved it). */
+    const char *dirs[3] = {folderName, "/mjpeg", "/"};
+    FRESULT fr[3] = {FR_OK, FR_OK, FR_OK};
+    path[0] = '\0';
+    for (int i = 0; i < 3 && path[0] == '\0'; i++) {
+      DIR dir;
+      FILINFO fno;
+      fr[i] = f_findfirst(&dir, &fno, dirs[i], "*.AVI");
+      if (fr[i] == FR_OK && fno.fname[0] != '\0') {
+        snprintf(path, sizeof(path), "%s/%s",
+                 (dirs[i][1] == '\0') ? "" : dirs[i], fno.fname);
+      }
+      f_closedir(&dir);
+    }
+    if (path[0] != '\0') {
+      /* Breadcrumb: visible on the ST while the AVI is opened/parsed,
+       * so a stall inside the open path can be told apart from a
+       * stall before it (screen would still show the boot pattern). */
+      snprintf(msg, sizeof(msg), "OPENING %s", path);
+      show_status("MD/MJPEG " RELEASE_VERSION, msg);
+      playing = mjpeg_open(path) == 0;
+      if (!playing) {
+        snprintf(msg, sizeof(msg), "CANNOT PLAY %s", path);
+        show_status("MD/MJPEG " RELEASE_VERSION, msg);
+      }
+    } else {
+      /* Show exactly where we looked + the FatFs result codes, so a
+       * misconfigured FOLDER (per-app flash config) is visible on the
+       * ST screen without needing the UART console. */
+      DPRINTF("No .AVI found in %s (fr=%d), /mjpeg (fr=%d) or / (fr=%d)\n",
+              folderName, fr[0], fr[1], fr[2]);
+      snprintf(msg, sizeof(msg), "NO .AVI IN %s (FR %d) /mjpeg (FR %d) / (FR %d)",
+               folderName, fr[0], fr[1], fr[2]);
+      show_status("MD/MJPEG " RELEASE_VERSION, msg);
+    }
+  } else {
+    show_status("MD/MJPEG " RELEASE_VERSION, "NO SD CARD");
+  }
+  cart_check("post-open");
 
-  // Main loop:
-  //   1. Drain the ROM3 commemul ring straight into the IKBD raw-byte
-  //      ring (one PIO sample per IKBD byte the m68k Timer-B handler
-  //      forwarded; the filter inside ikbd_consume_rom3_sample picks
-  //      out the $FB8200..$FB82FF window).
-  //   2. Run the IKBD demux on whatever bytes arrived.
-  //   3. Forward decoded key events to the dispatcher (which routes
-  //      to the menu or the active demo).
-  //   4. Re-render the cart framebuffer via the dispatcher (menu UI
-  //      or active demo's render_frame). The m68k VBL loop in
-  //      userfw.s blits this into an ST screen page once per VBL.
+  /* --- main loop --- */
   DPRINTF("Entering main loop\n");
+  uint32_t stall_last_shown = 0;
+  uint32_t stall_check_us = time_us_32();
   while (true) {
-    fb_pump_rom3();  /* drains ROM3 ring -> IKBD demux + VBL frame-sync */
+    fb_pump_rom3(); /* ROM3 ring -> IKBD demux + VBL frame-sync */
     ikbd_pump();
 
     ikbd_key_event_t k;
     while (ikbd_pop_key(&k)) {
-      demo_dispatcher_handle_key(&k);
+      /* ESC exit to GEM is handled inside ikbd.c; nothing else yet. */
+      (void)k;
     }
 
-    demo_dispatcher_render_frame();
+    if (playing) {
+      mjpeg_tick();
+      /* Stall detector: if no frame lands for 3 s, paint the player
+       * counters on the ST screen -- on-target diagnostics that work
+       * in release builds where the UART console is compiled out. */
+      uint32_t now = time_us_32();
+      if (now - stall_check_us > 3000000u) {
+        stall_check_us = now;
+        uint32_t shown = mjpeg_frames_shown();
+        static char dbg[64];
+        mjpeg_debug_status(dbg, sizeof(dbg));
+        DPRINTF("HB: %s\n", dbg); /* liveness heartbeat on the UART */
+        if (shown == stall_last_shown) {
+          show_status("MD/MJPEG STALLED", dbg);
+        }
+        stall_last_shown = shown;
+      }
+    }
     audio_render_frame();
+    cart_check("main-loop");
   }
 }

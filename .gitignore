@@ -64,3 +64,14 @@ dist/
 docs/epics/
 __pycache__/
 *.pyc
+
+# Local media + demo-strip backup (never commit)
+*.mp4
+*.avi
+*.AVI
+rp.bak/
+uuid.txt
+*.bak
+tmp/
+screenlog.*
+.DS_Store

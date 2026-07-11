@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Neil Rackett
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* Based on GCC ARM embedded samples.
    Defines the following symbols for use by code:
     __exidx_start
@@ -295,8 +300,14 @@ SECTIONS
 
 
 
-    /* stack limit is poorly named, but historically is maximum heap ptr */
-    __StackLimit = ORIGIN(RAM) + LENGTH(RAM) + LENGTH(ROM_IN_RAM);
+    /* stack limit is poorly named, but historically is maximum heap ptr.
+     * Must NOT include ROM_IN_RAM: pico-sdk's _sbrk bounds the heap by
+     * this symbol, and letting it grow past ORIGIN(ROM_IN_RAM) hands the
+     * cartridge region (the code the m68k executes over the cart bus) to
+     * malloc -- FatFs LFN buffers then corrupt it at runtime and the ST
+     * crashes with bombs. Capped at the RAM/cart boundary so malloc
+     * fails cleanly instead. */
+    __StackLimit = ORIGIN(RAM) + LENGTH(RAM);
     __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
     __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
     __StackOneBottom = __StackOneTop - SIZEOF(.stack1_dummy);

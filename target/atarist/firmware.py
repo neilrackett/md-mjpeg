@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Neil Rackett
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 import urllib.request
 import os
 import argparse
@@ -32,8 +35,14 @@ def binary_to_c_array(input_source, output_file, array_name, endian_format="litt
     if len(trimmed_data) % 2 != 0:
         raise ValueError("The binary file size (after trimming zeros) should be an even number of bytes for word processing.")
 
-    # Prepare the output content
-    content = f"const uint16_t {array_name}[] = {{\n"
+    # Prepare the output content. The array MUST be 4-byte aligned: the
+    # RP2040 boot path copies it to RAM with the XIP stream DMA
+    # (COPY_FIRMWARE_TO_RAM_DMA in memfunc.h), and XIP_STREAM_ADDR
+    # silently truncates to a 32-bit word address -- a 2-mod-4 placement
+    # (the natural alignment of a uint16_t array is only 2) makes the
+    # stream start 2 bytes early and the whole cartridge image lands in
+    # RAM shifted, crashing the m68k.
+    content = f"const uint16_t __attribute__((aligned(4))) {array_name}[] = {{\n"
 
     # Convert trimmed data to comma-separated hex values with MAX_WORDS_PER_LINE words per line
     for i in range(offset, len(trimmed_data) - offset, 2 * MAX_WORDS_PER_LINE):

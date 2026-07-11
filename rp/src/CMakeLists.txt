@@ -1,4 +1,8 @@
 # Set minimum required version of CMake
+#
+# examples/hello_text variant of rp/src/CMakeLists.txt: the five demo_*.c
+# sources and the hardware_interp link (only the demos/menu used the SIO
+# interpolator) are removed. apply.sh copies this over rp/src/CMakeLists.txt.
 cmake_minimum_required(VERSION 3.26)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -88,15 +92,17 @@ add_subdirectory(settings)
 
 # Tell CMake where to find other source code
 add_subdirectory(${FATFS_SDK_PATH}/src build)
-  
+
 # Tell CMake where to find the executable source file
-add_executable(${PROJECT_NAME} 
+add_executable(${PROJECT_NAME}
         main.c
 )
 
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/romemul.pio)
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/commemul.pio)
 
+# Sources: the framebuffer/audio/bus modules. The demo_*.c files are gone
+# in this example -- emul.c is the whole app.
 target_sources(${PROJECT_NAME} PRIVATE
         aconfig.c
         audio.c
@@ -111,26 +117,32 @@ target_sources(${PROJECT_NAME} PRIVATE
         gconfig.c
         ikbd.c
         hw_config.c
+        jpegdec_core.c
+        mjpeg.c
+        mjpeg_quant.c
         palette.c
-        demo_menu.c
-        demo_parallax.c
-        demo_3d.c
-        demo_sprites.c
-        demo_cojorotozoom.c
         reset.c
         romemul.c
         sdcard.c
         select.c
         settings/settings.c)
 
+# JPEGDEC (jpegdec/ submodule) picks its platform from preprocessor
+# macros and defaults to Arduino. __MCUXPRESSO selects its generic
+# embedded-C path (plain stdlib includes + the C API with external
+# linkage). Scoped to the three sources that include JPEGDEC.h so the
+# bogus platform macro can't leak into the rest of the build.
+set_source_files_properties(jpegdec_core.c mjpeg.c mjpeg_quant.c
+    PROPERTIES COMPILE_DEFINITIONS __MCUXPRESSO)
+
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
 
-# Link libraries required for the project
+# Link libraries required for the project (hardware_interp dropped -- only
+# the demos used the SIO interpolator; add it back if your app needs it).
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${LINK_LIBRARIES}        # External or additional libraries passed as variables
     hardware_flash           # Flash memory access
-    hardware_interp          # SIO interpolators (cojorotozoom texel addressing)
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico                # FATFS library
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
@@ -154,7 +166,8 @@ target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
-    ${CMAKE_CURRENT_LIST_DIR}/..)
+    ${CMAKE_CURRENT_LIST_DIR}/..
+    ${REPO_ROOT}/jpegdec/src)
 
 
 # Use reduced space for ROMs
@@ -180,7 +193,7 @@ if(NOT RELEASE_VERSION)
     else()
         set(VERSION_FILE_NAME "version-${RELEASE_TYPE}.txt")
     endif()
-    
+
     # Remove newline character if present
     string(STRIP "${RELEASE_VERSION}" RELEASE_VERSION)
 
@@ -195,10 +208,7 @@ if(NOT RELEASE_DATE)
         set(RELEASE_DATE ${CURRENT_DATE_TIME})
 endif()
 
-# Default _DEBUG to 0 when the env var isn't set at all. `if (NOT _DEBUG)`
-# would also fire for the string "0" (CMake treats "0" as falsy), silently
-# turning a CMakePresets release preset into a debug build. Mirrors the
-# pattern used in rp2-atarist-rpikb's CMakeLists.txt.
+# Default _DEBUG to 0 when the env var isn't set at all.
 if ("${_DEBUG}" STREQUAL "")
         set(_DEBUG 0)
 endif()
@@ -232,7 +242,7 @@ else()
     add_definitions(-DCURRENT_APP_UUID_KEY=\"44444444-4444-4444-8444-444444444444\")
 endif()
 
-# Pass the _DEBUG flag to the C compiler
+# Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
 # Device/Computer type
@@ -242,7 +252,7 @@ add_definitions(-DDISPLAY_ATARIST)
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 
 
-# Remove unused data
+# Remove unused data
 target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--gc-sections"
    "-Wl,--strip-all"
