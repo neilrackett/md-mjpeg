@@ -100,6 +100,30 @@
 #define MQ_CON_NUM 9  /* contrast gain 9/8 = 1.125x (around mid-grey 7.5) */
 #define MQ_CON_DEN 8
 
+/* Histogram / dither channel depth. Default RGB333 = every channel 8
+ * levels, 512 bins (exactly the ST's colour count -- no sampling error).
+ * MQ_HIST=g4 (RGB343) gives GREEN a 4th bit (16 levels) -> 1024 bins,
+ * for finer luminance/greyscale palette selection where it matters most
+ * (green is ~59% of luminance); red and blue stay 3-bit. Costs +1.5 KB
+ * .bss (hist 2 KB + map 1 KB). A full RGB444 histogram (4096 bins + a
+ * 4 KB map, ~10.5 KB) does NOT fit -- it drops heap headroom below the
+ * settings library's ~14 KB boot allocation and OOM-panics; green-4 is
+ * the affordable win (see the RGB444 note in AGENTS.md). Parameterised
+ * so RGB333 compiles byte-identical to before. */
+#ifndef MQ_HIST_G4
+#define MQ_HIST_G4 0
+#endif
+#if MQ_HIST_G4
+#define MQ_GBITS 4u
+#else
+#define MQ_GBITS 3u
+#endif
+#define MQ_GMAX ((1u << MQ_GBITS) - 1u)  /* green max level: 7 or 15      */
+#define MQ_GSH 3u                          /* green bit shift (B is 0..2)  */
+#define MQ_RSH (3u + MQ_GBITS)             /* red bit shift: 6 or 7        */
+#define MQ_BINS (8u * (MQ_GMAX + 1u) * 8u) /* 512 or 1024                  */
+#define MQ_GSCALE (105u / MQ_GMAX)         /* green bin -> 0..105: 15 or 7 */
+
 /* Build an ST/STE palette word from three 0..15 (RGB444) channels.
  * The STE stores each channel's low bit at the top of its nibble
  * (bits 11/7/3) and the high 3 bits in the positions the plain ST
@@ -128,19 +152,19 @@
  * later .data growth pushed the hole past the ring boundary, jumping
  * .bss a full 32 KB and overflowing RAM. Keeping only s_jpg in the hole
  * restores comfortable margin. */
-static uint16_t lutR[MQ_DITHER_N][32]; /* 5-bit red -> 3, <<6 */
-static uint16_t lutG[MQ_DITHER_N][64]; /* 6-bit grn -> 3, <<3 */
-static uint8_t lutB[MQ_DITHER_N][32];  /* 5-bit blu -> 3     */
+static uint16_t lutR[MQ_DITHER_N][32]; /* 5-bit red -> 3, << MQ_RSH */
+static uint16_t lutG[MQ_DITHER_N][64]; /* 6-bit grn -> MQ_GBITS, << 3 */
+static uint8_t lutB[MQ_DITHER_N][32];  /* 5-bit blu -> 3            */
 
 /* Frame histogram + palette map (also plain .bss). */
 
-/* RGB333 histogram of the frame being decoded. 512 bins covers every
- * colour the ST can show, so no sampling error. uint16 is enough:
- * a bin can hold at most one full frame = 64 000 pixels. */
-static uint16_t hist[512];
+/* Histogram of the frame being decoded, one bin per representable
+ * dithered colour (MQ_BINS: 512 for RGB333, 1024 for RGB343). uint16 is
+ * enough: a bin can hold at most one full frame = 64 000 pixels. */
+static uint16_t hist[MQ_BINS];
 
-/* RGB333 (9-bit) -> palette index, rebuilt per frame. */
-static uint8_t map9[512];
+/* Dithered-colour index -> palette index, rebuilt per frame. */
+static uint8_t map9[MQ_BINS];
 
 /* Current palette in 0..15 (RGB444) channel space. Published via
  * PALETTE_STE_RGB, so a plain ST sees the top-3-bit RGB333 form. With
@@ -184,9 +208,9 @@ static const uint8_t bayer[MQ_DITHER_N] = {
  * pal*7) so the comparison is exact and division-free. 512 x 16
  * iterations, ~0.5 ms at O3. */
 static void build_map(void) {
-  for (unsigned c = 0; c < 512; c++) {
-    int r = (int)((c >> 6) & 7u) * 15;
-    int g = (int)((c >> 3) & 7u) * 15;
+  for (unsigned c = 0; c < MQ_BINS; c++) {
+    int r = (int)((c >> MQ_RSH) & 7u) * 15;
+    int g = (int)((c >> MQ_GSH) & MQ_GMAX) * (int)MQ_GSCALE;
     int b = (int)(c & 7u) * 15;
     unsigned best = 0;
     unsigned best_d = ~0u;
@@ -227,12 +251,12 @@ void mq_init(void) {
 #endif
     for (unsigned c = 0; c < 32; c++) {
       unsigned v = (c * 7u * MQ_DITHER_2N + t * 31u) / (31u * MQ_DITHER_2N);
-      lutR[p][c] = (uint16_t)(v << 6);
+      lutR[p][c] = (uint16_t)(v << MQ_RSH);
       lutB[p][c] = (uint8_t)v;
     }
     for (unsigned c = 0; c < 64; c++) {
-      unsigned v = (c * 7u * MQ_DITHER_2N + t * 63u) / (63u * MQ_DITHER_2N);
-      lutG[p][c] = (uint16_t)(v << 3);
+      unsigned v = (c * MQ_GMAX * MQ_DITHER_2N + t * 63u) / (63u * MQ_DITHER_2N);
+      lutG[p][c] = (uint16_t)(v << MQ_GSH);
     }
   }
 
@@ -342,17 +366,17 @@ int __not_in_flash_func(mq_draw)(JPEGDRAW *pDraw) {
 /* --- median cut ------------------------------------------------- */
 
 typedef struct {
-  uint8_t r0, r1, g0, g1, b0, b1; /* inclusive bounds in 0..7 space */
+  uint8_t r0, r1, g0, g1, b0, b1; /* inclusive bounds; r,b 0..7, g 0..MQ_GMAX */
   uint32_t cnt;
 } box_t;
 
 /* Tighten a box to its occupied bins and recount it. */
 static void box_shrink(box_t *bx) {
-  unsigned rmin = 7, rmax = 0, gmin = 7, gmax = 0, bmin = 7, bmax = 0;
+  unsigned rmin = 7, rmax = 0, gmin = MQ_GMAX, gmax = 0, bmin = 7, bmax = 0;
   uint32_t cnt = 0;
   for (unsigned r = bx->r0; r <= bx->r1; r++) {
     for (unsigned g = bx->g0; g <= bx->g1; g++) {
-      const uint16_t *row = &hist[(r << 6) | (g << 3)];
+      const uint16_t *row = &hist[(r << MQ_RSH) | (g << MQ_GSH)];
       for (unsigned b = bx->b0; b <= bx->b1; b++) {
         uint32_t n = row[b];
         if (n) {
@@ -386,17 +410,17 @@ static uint32_t box_slice(const box_t *bx, int axis, unsigned v) {
     case 0:
       for (unsigned g = bx->g0; g <= bx->g1; g++)
         for (unsigned b = bx->b0; b <= bx->b1; b++)
-          n += hist[(v << 6) | (g << 3) | b];
+          n += hist[(v << MQ_RSH) | (g << MQ_GSH) | b];
       break;
     case 1:
       for (unsigned r = bx->r0; r <= bx->r1; r++)
         for (unsigned b = bx->b0; b <= bx->b1; b++)
-          n += hist[(r << 6) | (v << 3) | b];
+          n += hist[(r << MQ_RSH) | (v << MQ_GSH) | b];
       break;
     default:
       for (unsigned r = bx->r0; r <= bx->r1; r++)
         for (unsigned g = bx->g0; g <= bx->g1; g++)
-          n += hist[(r << 6) | (g << 3) | v];
+          n += hist[(r << MQ_RSH) | (g << MQ_GSH) | v];
       break;
   }
   return n;
@@ -426,7 +450,7 @@ static void boost_entry(uint8_t *pr, uint8_t *pg, uint8_t *pb) {
 
 void mq_frame_done(void) {
   box_t boxes[PALETTE_ENTRIES];
-  boxes[0] = (box_t){0, 7, 0, 7, 0, 7, 0};
+  boxes[0] = (box_t){0, 7, 0, (uint8_t)MQ_GMAX, 0, 7, 0};
   box_shrink(&boxes[0]);
   if (boxes[0].cnt == 0) {
     return; /* nothing decoded; keep the current palette */
@@ -507,20 +531,22 @@ void mq_frame_done(void) {
     for (unsigned r = bx->r0; r <= bx->r1; r++) {
       for (unsigned g = bx->g0; g <= bx->g1; g++) {
         for (unsigned b = bx->b0; b <= bx->b1; b++) {
-          uint32_t n = hist[(r << 6) | (g << 3) | b];
+          uint32_t n = hist[(r << MQ_RSH) | (g << MQ_GSH) | b];
           sr += n * r;
           sg += n * g;
           sb += n * b;
         }
       }
     }
-    /* Weighted centroid is a fraction of the 0..7 bin range; scale it
-     * onto the 0..15 RGB444 grid (x15/7) with round-to-nearest so the
-     * palette entry uses the STE's full precision. */
+    /* Weighted centroid is a fraction of each channel's bin range; scale
+     * onto the 0..15 RGB444 grid (r,b x15/7; g x15/MQ_GMAX -- x1 when
+     * green is already 4-bit) with round-to-nearest so the palette entry
+     * uses the STE's full precision. */
     uint32_t c = bx->cnt ? bx->cnt : 1;
-    uint32_t den = 7u * c;
+    uint32_t den = 7u * c;      /* red / blue: 0..7 -> 0..15 */
+    uint32_t deng = MQ_GMAX * c; /* green: 0..MQ_GMAX -> 0..15 */
     tr[i] = (uint8_t)((sr * 15u + den / 2u) / den);
-    tg[i] = (uint8_t)((sg * 15u + den / 2u) / den);
+    tg[i] = (uint8_t)((sg * 15u + deng / 2u) / deng);
     tb[i] = (uint8_t)((sb * 15u + den / 2u) / den);
   }
 #if MQ_SATURATE

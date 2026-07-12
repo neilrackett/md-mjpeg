@@ -35,7 +35,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | File | Role |
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
-| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram stay RGB333, so distinct-level count (esp. greyscale) is unchanged. A true colour-count win needs an RGB444 histogram/dither — blocked by the `.uninitialized_data` hole size (lesson 4). |
+| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop, stall detector, cart-corruption canary |
 | `tools/video_to_avi.sh` | ffmpeg wrapper producing the AVI format contract |
@@ -91,8 +91,19 @@ make tag       # tag HEAD with version.txt and push (release workflow)
   (contrast ×`MQ_CON_NUM`/`MQ_CON_DEN`, default 1.125). Counters the wash-out from
   median-cut box means (each entry is a population average, which pulls toward grey).
   Grey stays grey (chroma-preserving); tune the four constants at the top of the
-  file. If this + 2×2 dither still isn't enough, the next step is a full RGB444
-  histogram/dither (more distinct levels), which is RAM-gated by lesson 4.
+  file.
+- **Histogram-depth flag**: default RGB333 (512 bins, every channel 8 levels);
+  `MQ_HIST=g4 ./build.sh ...` builds RGB343 — green gets a 4th bit (16 levels,
+  1024 bins) for finer luminance/greyscale palette selection (green is ~59 % of
+  luminance), red/blue stay 3-bit. Env→define `MQ_HIST_G4` on `mjpeg_quant.c`,
+  which parameterises the dither LUTs, histogram, median cut and map via
+  `MQ_GBITS`/`MQ_GMAX`/`MQ_RSH`/`MQ_BINS` (RGB333 compiles byte-identical). Costs
+  +1.5 KB `.bss` (hist 2 KB + map 1 KB; heap headroom 19.3→17.7 KB, still safe).
+  **Full RGB444 does NOT fit**: a 4096-bin histogram (8 KB) + 4 KB map is +10.5 KB,
+  which drops heap headroom to ~8.8 KB — below the settings library's ~14 KB boot
+  malloc → OOM panic (lesson 4). Green-4 is the affordable middle ground; RGB443
+  (R+G 4-bit, 2048 bins, map parked in the `.uninitialized_data` hole) would be the
+  next step up if the extra red precision is wanted and the hole has ~1.7 KB spare.
 - There is no test suite. Verification = build + UF2 on hardware + UART
   console + on-screen diagnostics. Offline validation patterns that worked:
   compile `jpeg.inl` + the exact decode/draw code as a host binary against

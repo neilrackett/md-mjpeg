@@ -169,6 +169,17 @@ else()
     message(STATUS "Palette saturation boost: ON (default)")
 endif()
 
+# Histogram depth: default RGB333 (512 bins). MQ_HIST=g4 gives green a
+# 4th bit (RGB343, 1024 bins, +1.5 KB) for finer luminance selection.
+# (Full RGB444 does not fit the RAM budget -- see mjpeg_quant.c.)
+if("$ENV{MQ_HIST}" STREQUAL "g4")
+    message(STATUS "Histogram: RGB343 green-4bit (MQ_HIST_G4=1)")
+    set_property(SOURCE mjpeg_quant.c APPEND PROPERTY
+        COMPILE_DEFINITIONS MQ_HIST_G4=1)
+else()
+    message(STATUS "Histogram: RGB333 (default)")
+endif()
+
 # Audio back-end is auto-detected at runtime (STE DMA vs YM), reported
 # by the m68k over the cart bus -- no build flag. The m68k-side
 # FORCE_NO_DMA=1 (see target/atarist/Makefile) forces the YM fallback

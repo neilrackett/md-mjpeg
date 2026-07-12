@@ -13,6 +13,7 @@ UART_DEV ?=
 #   MQ_DITHER=bayer     2x2 Bayer dither         (default: 32x32 blue noise)
 #   MQ_HYSTERESIS=off   raw per-frame palette    (default: temporal slew on)
 #   MQ_SATURATE=off     raw median-cut colours   (default: sat + contrast boost)
+#   MQ_HIST=g4          RGB343 green-4bit hist   (default: RGB333 512-bin)
 #   FORCE_NO_DMA=1      force YM audio fallback   (default: auto-detect STE DMA)
 
 export STCMD_NO_TTY=1
