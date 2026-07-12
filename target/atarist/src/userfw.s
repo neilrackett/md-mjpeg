@@ -272,9 +272,18 @@ STE_DMA_END_MID       equ $FFFF8911
 STE_DMA_END_LO        equ $FFFF8913
 STE_DMA_MODE          equ $FFFF8921          ; bit7 = mono, bits1-0 = rate
 STE_DMA_MODE_VAL      equ $82                ; mono + 25033 Hz (rate = 2)
-STE_SND_BUF           equ $00077D00          ; page A tail (even, multiple of 4)
+STE_DMA_CNT_MID       equ $FFFF890B          ; frame COUNTER mid byte (read-only)
+; Double buffer in the two screen-page tails. Loop-mode DMA plays one
+; while .after_copy refills the OTHER, so the m68k write never crosses
+; the DMA read pointer (the single-buffer version tore one sample per
+; VBL -> constant ~50 Hz buzz). Which buffer the DMA is in is read from
+; bit 7 of the frame-counter mid byte: A ($77Dxx, mid $7D/$7E -> bit7=0)
+; vs B ($7FDxx, mid $FD/$FE -> bit7=1).
+STE_SND_BUF_A         equ $00077D00          ; page A tail
+STE_SND_BUF_B         equ $0007FD00          ; page B tail
 STE_SND_BYTES         equ 500                ; ~1 PAL VBL @ 25033 Hz (mult of 4)
-STE_SND_END           equ (STE_SND_BUF + STE_SND_BYTES)
+STE_SND_A_END         equ (STE_SND_BUF_A + STE_SND_BYTES)
+STE_SND_B_END         equ (STE_SND_BUF_B + STE_SND_BYTES)
 
 ; Cookie jar (_p_cookies) + _SND cookie for DMA-sound detection.
 COOKIE_JAR_PTR        equ $000005A0          ; longword: cookie jar base (0 = none)
@@ -548,22 +557,27 @@ userfw:
     bra     .boot_audio_done
 
 .boot_audio_dma:
-    ; --- STE DMA sound init: mono 25033 Hz, loop mode. Silence the
-    ; buffer, program start/end (24-bit, split hi/mid/lo), start the
-    ; loop. The DMA then free-runs; .after_copy refills the buffer each
-    ; VBL. No Timer-B, no YM writes -- the DMA needs no per-sample CPU.
-    lea     STE_SND_BUF, a0
+    ; --- STE DMA sound init: mono 25033 Hz, loop mode, double-buffered.
+    ; Silence both buffers, program start/end to buffer A, start the
+    ; loop. The DMA free-runs; .after_copy refills whichever buffer the
+    ; DMA isn't reading and points the loop at it. No Timer-B, no YM.
+    lea     STE_SND_BUF_A, a0
     move.w  #(STE_SND_BYTES/4)-1, d0
-.ste_snd_clr:
+.ste_snd_clr_a:
     clr.l   (a0)+
-    dbf     d0, .ste_snd_clr
+    dbf     d0, .ste_snd_clr_a
+    lea     STE_SND_BUF_B, a0
+    move.w  #(STE_SND_BYTES/4)-1, d0
+.ste_snd_clr_b:
+    clr.l   (a0)+
+    dbf     d0, .ste_snd_clr_b
     move.b  #STE_DMA_MODE_VAL, STE_DMA_MODE.w
-    move.b  #((STE_SND_BUF>>16)&$FF), STE_DMA_START_HI.w
-    move.b  #((STE_SND_BUF>>8)&$FF), STE_DMA_START_MID.w
-    move.b  #(STE_SND_BUF&$FF), STE_DMA_START_LO.w
-    move.b  #((STE_SND_END>>16)&$FF), STE_DMA_END_HI.w
-    move.b  #((STE_SND_END>>8)&$FF), STE_DMA_END_MID.w
-    move.b  #(STE_SND_END&$FF), STE_DMA_END_LO.w
+    move.b  #((STE_SND_BUF_A>>16)&$FF), STE_DMA_START_HI.w
+    move.b  #((STE_SND_BUF_A>>8)&$FF), STE_DMA_START_MID.w
+    move.b  #(STE_SND_BUF_A&$FF), STE_DMA_START_LO.w
+    move.b  #((STE_SND_A_END>>16)&$FF), STE_DMA_END_HI.w
+    move.b  #((STE_SND_A_END>>8)&$FF), STE_DMA_END_MID.w
+    move.b  #(STE_SND_A_END&$FF), STE_DMA_END_LO.w
     move.b  #$03, STE_DMA_CTRL.w          ; play + loop
 
 .boot_audio_done:
@@ -657,19 +671,42 @@ userfw:
     lea     SNDCAP_WINDOW_BASE, a1
     tst.b   (a1, d1.w)
 
-    ; When DMA sound is active, refill its page-tail buffer from the
-    ; cart PCM (loop-mode DMA reads STE_SND_BUF continuously; one VBL
-    ; of fresh signed samples each frame). A1/A2/D1 are scratch
-    ; (clobbered by FBDRV_INLINE, not consumed by the page-flip below
-    ; which uses A5/D0). ~125 longwords from the cart, ~0.3 ms.
+    ; When DMA sound is active, refill the buffer the DMA is NOT reading
+    ; (double-buffer) and point the loop at it, so the write never
+    ; crosses the DMA read pointer. Bit 7 of the frame-counter mid byte
+    ; tells us the current buffer: 0 = A -> refill B; 1 = B -> refill A.
+    ; D1/D2/D3/A1/A2 are scratch (clobbered by FBDRV_INLINE; the
+    ; page-flip below uses A5/D0). ~125 longwords from the cart, ~0.3 ms.
     tst.b   UFW_HAS_DMA
     beq.s   .no_dma_refill
+    btst    #7, STE_DMA_CNT_MID.w
+    bne.s   .snd_use_a                   ; DMA in B -> refill A
+    move.l  #STE_SND_BUF_B, d2           ; DMA in A -> refill B
+    bra.s   .snd_have_buf
+.snd_use_a:
+    move.l  #STE_SND_BUF_A, d2
+.snd_have_buf:
+    ; Copy one VBL of fresh signed PCM from the cart buffer into d2.
     lea     AUDIO_BUFFER_ADDR, a1
-    lea     STE_SND_BUF, a2
+    movea.l d2, a2
     move.w  #(STE_SND_BYTES/4)-1, d1
 .ste_snd_copy:
     move.l  (a1)+, (a2)+
     dbf     d1, .ste_snd_copy
+    ; Point the DMA loop at the just-filled buffer: start = d2,
+    ; end = d2 + STE_SND_BYTES (each split hi/mid/lo).
+    move.l  d2, d3
+    move.b  d3, STE_DMA_START_LO.w
+    lsr.l   #8, d3
+    move.b  d3, STE_DMA_START_MID.w
+    lsr.l   #8, d3
+    move.b  d3, STE_DMA_START_HI.w
+    add.l   #STE_SND_BYTES, d2
+    move.b  d2, STE_DMA_END_LO.w
+    lsr.l   #8, d2
+    move.b  d2, STE_DMA_END_MID.w
+    lsr.l   #8, d2
+    move.b  d2, STE_DMA_END_HI.w
 .no_dma_refill:
 
     ; Flip the video base to the just-written page. A5 still holds

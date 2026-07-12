@@ -11,13 +11,15 @@ boot-related.
 **MD/MJPEG** — a video player microfirmware for the
 [SidecarTridge Multi-device](https://sidecartridge.com) (Raspberry Pi Pico /
 RP2040 in the Atari ST cartridge slot). It streams a standard AVI (MJPEG
-320×200 @ 25 fps + mono u8 PCM @ 5600 Hz) from the SidecarT's SD card,
-decodes JPEG frames on the RP2040, quantizes each frame to its own 16-colour
-ST palette (median cut over an exact RGB333 histogram + 2×2 Bayer ordered
-dither), and blits it to the ST screen over the cartridge bus at up to
-25 fps with YM2149 audio. A/V sync is audio-master: the fill callback's
-sample clock paces video; when decoding falls ≥2 frames behind, frames are
-skipped so audio never stalls.
+320×200 @ 25 fps + mono u8 PCM @ 5600 Hz for YM, or 25033 Hz for STE DMA
+sound) from the SidecarT's SD card, decodes JPEG frames on the RP2040,
+quantizes each frame to its own 16-colour ST palette (median cut over an
+exact RGB333 histogram + blue-noise ordered dither + a saturation/contrast
+boost), and blits it to the ST screen over the cartridge bus at up to 25 fps.
+Audio is universal: the firmware auto-detects STE DMA sound (25 kHz 8-bit)
+and falls back to YM2149 (~5.6 kHz) on a plain ST. A/V sync is audio-master:
+the fill callback's sample clock paces video; when decoding falls ≥2 frames
+behind, frames are skipped so audio never stalls.
 
 Built from **md-framebuffer-template** (the framework does the heavy
 lifting): dual page-flipped framebuffer on the ST side, real 50 Hz VBL lock,
@@ -63,14 +65,17 @@ make tag       # tag HEAD with version.txt and push (release workflow)
   that diff is expected).
 - Bump `version.txt` (`v0.x.y`) for every flashed build — it shows in the
   UART banner and on-screen status line and makes hardware reports traceable.
-- **Dither A/B flag**: `MQ_DITHER=bluenoise ./build.sh ...` (or `MQ_DITHER=bluenoise make build`)
-  builds the 32×32 blue-noise dither; unset/anything else = 4×4 Bayer (default).
-  Read as an env var in `rp/src/CMakeLists.txt` → `MQ_DITHER_BLUENOISE` define on
-  `mjpeg_quant.c`. The blue-noise matrix (`rp/src/include/bluenoise.h`, `const` →
-  flash, regenerate with `python3 tools/gen_bluenoise.py`) quantizes to the same 16
-  levels as Bayer and shares all the LUTs, so both cost the same and differ only in
-  threshold pattern. `build.sh` wipes `dist/` each run, so to keep both UF2s copy
-  each out under a distinct name between builds.
+- **Dither A/B flag**: 32×32 blue noise is the default (marginally the best of the
+  three tried on hardware); `MQ_DITHER=bayer ./build.sh ...` (or `make build`) builds
+  the 2×2 Bayer instead. Read as an env var in `rp/src/CMakeLists.txt` →
+  `MQ_DITHER_BLUENOISE` define on `mjpeg_quant.c` (default 1 = blue noise). The
+  blue-noise matrix (`rp/src/include/bluenoise.h`, `const` → flash, regenerate with
+  `python3 tools/gen_bluenoise.py`) uses 16 dither levels vs the 2×2 tile's 4; both
+  drive the same per-level pre-shifted LUTs (`MQ_DITHER_N` entries) and differ only
+  in the threshold pattern. Blue noise's LUTs are the larger ones (16 vs 4 entries,
+  ~2.7 KB more `.bss`). `build.sh` wipes `dist/` each run, so to keep both UF2s copy
+  each out under a distinct name between builds. (A 4×4 Bayer — 16 levels, dottier in
+  motion on hardware — was tried and reverted; it's in git history.)
 - **Palette hysteresis flag**: on by default; `MQ_HYSTERESIS=off ./build.sh ...`
   builds the raw per-frame palette. Same env→define wiring in CMakeLists →
   `MQ_HYSTERESIS` in `mjpeg_quant.c`. On, `mq_frame_done` slews the published
@@ -78,6 +83,16 @@ make tag       # tag HEAD with version.txt and push (release workflow)
   within `MQ_HYST_DEADBAND`) and snaps when the whole-palette change exceeds
   `MQ_HYST_SNAP` (a scene cut) — kills the frame-to-frame shimmer/"pumping" that
   reads as banding in motion. Tune the three constants at the top of the file.
+- **Palette saturation/contrast flag**: on by default; `MQ_SATURATE=off ./build.sh ...`
+  publishes the raw median-cut centroids. Same env→define wiring in CMakeLists →
+  `MQ_SATURATE` in `mjpeg_quant.c`. On, `mq_frame_done` runs each centroid through
+  `boost_entry` before the luminance sort — pushing it away from its own grey level
+  (saturation ×`MQ_SAT_NUM`/`MQ_SAT_DEN`, default 1.25) and away from mid-grey
+  (contrast ×`MQ_CON_NUM`/`MQ_CON_DEN`, default 1.125). Counters the wash-out from
+  median-cut box means (each entry is a population average, which pulls toward grey).
+  Grey stays grey (chroma-preserving); tune the four constants at the top of the
+  file. If this + 2×2 dither still isn't enough, the next step is a full RGB444
+  histogram/dither (more distinct levels), which is RAM-gated by lesson 4.
 - There is no test suite. Verification = build + UF2 on hardware + UART
   console + on-screen diagnostics. Offline validation patterns that worked:
   compile `jpeg.inl` + the exact decode/draw code as a host binary against
@@ -87,9 +102,13 @@ make tag       # tag HEAD with version.txt and push (release workflow)
 ### Video encoding contract
 
 `tools/video_to_avi.sh in.mp4 [out.avi] [quality]`: 320×200 centre-crop-fill,
-25 fps MJPEG (baseline yuvj420p) + mono pcm_u8 at **5600 Hz** (= exactly the
-224 bytes/VBL the m68k Timer-B handler consumes; 224 samples per video frame
-gives lock-step A/V pacing). `hqdn3d` denoise is always applied. **Quality is
+25 fps MJPEG (baseline yuvj420p) + mono pcm_u8. Audio rate defaults to
+**5600 Hz** (YM path; = the 224 bytes/VBL the m68k Timer-B handler consumes);
+`STE=1 tools/video_to_avi.sh ...` selects **25033 Hz** for STE DMA sound — the
+universal firmware downsamples that for YM on a plain ST, so 25 kHz plays
+everywhere and is the right choice if any target is an STE. `hqdn3d` denoise +
+`loudnorm` and tight interleave (`-max_interleave_delta 0`) are always applied.
+**Quality is
 a decode-speed dial**: measured on hardware, q7 ≈ 52–76 ms/frame (~16 fps
 effective, ~1/3 frames skipped), q11+denoise ≈ ~30 % faster (~40 ms ≈ 25 fps).
 The 16-colour dither masks most of the quality difference — prefer higher q.
@@ -132,17 +151,19 @@ Things that cost real debugging time. Do not re-learn them.
    commemul ring 32 768 (+ the app's ring/tables). Because `.bss` sorts by
    alignment and the commemul ring needs 32 KB alignment, `.bss` starts at
    `0x20008000` leaving a **~22 KB dead gap** after `.data`. Park large
-   buffers there with pico-sdk's `__uninitialized_ram(name)` (JPEGIMAGE
-   `s_jpg` ~18 KB + the 4x4 dither LUTs live there now). Rules: contents
-   are NOT zeroed at boot (initialize explicitly), and the gap contents must
-   stay below `0x20008000` or `.bss` jumps 32 KB. **The gap is nearly full
-   — ~144 B spare after the 4x4 Bayer LUTs**; `hist`/`map9` were pushed to
-   `.bss` to make room. Overflowing it is caught by the linker (`.bss will
+   buffers there with pico-sdk's `__uninitialized_ram(name)` (only JPEGIMAGE
+   `s_jpg` ~18 KB lives there now; the dither LUTs and `hist`/`map9` are in
+   ordinary `.bss`). Rules: contents are NOT zeroed at boot (initialize
+   explicitly), and the gap contents must stay below `0x20008000` or `.bss`
+   jumps 32 KB. **With only `s_jpg` in the hole the margin is comfortable
+   (~4 KB)** — the LUTs were pulled out to `.bss` when the menu's statics
+   tipped the then-packed hole past the boundary (jumping `.bss` a full
+   32 KB and overflowing RAM); see the `.uninitialized_data` note in
+   `mjpeg_quant.c`. Overflowing it is caught by the linker (`.bss will
    not fit in region RAM`), NOT silent — but the build script still prints
    "Build completed successfully" on a failed RP link, so after any static
    growth verify `[100%] Built target rp` / `Linking ... rp.elf` appeared
-   and re-check `__bss_end__` in the map. To grow the LUTs, store 3-bit
-   values and shift at use (halves them) rather than forcing the 32 KB jump.
+   and re-check `__bss_end__` in the map.
 
 5. **Debug builds lose the cartridge boot race.** `DEBUG_MODE=1` prints
    ~6 KB of settings/lookup dumps at 115200 baud *before* `emul_start()`
@@ -227,6 +248,15 @@ the 64-entry Ghostbusters LUT (`ghost_lut` in mjpeg.c; same table as
 to ~50 Hz and must be called at least once per VBL — during long decodes the
 JPEGDEC draw callback calls `mjpeg_service()` (rom3 pump + ikbd + audio)
 every band, which is what keeps audio glitch-free.
+
+On an STE the firmware instead uses **DMA sound** (25 kHz, 8-bit signed): the
+RP passes the AVI's PCM through unchanged and `userfw.s` plays it from a
+double buffer in the two screen-page tails (`$77D00`/`$7FD00`), swapping on
+the DMA frame counter so the m68k write never crosses the read pointer. The
+path is auto-detected at boot (`_SND` cookie, reported to the RP each VBL via
+`fb_rom3_dispatch` → `audio_set_mode`); on a plain ST the same 25 kHz stream
+is box-averaged down for the YM callback. Full detail in the DMA-sound memory
+note; both paths consume 500 source samples/VBL so A/V pacing is identical.
 
 ### Shared 64 KB cartridge region (`$FA0000` ↔ RP `0x20030000`)
 

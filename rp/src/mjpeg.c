@@ -31,10 +31,14 @@
 #include "audio.h"
 #include "debug.h"
 #include "fb.h"
+#include "fb_blit.h"
+#include "fb_font.h"
 #include "ff.h"
 #include "ikbd.h"
 #include "mjpeg_quant.h"
 #include "pico/time.h"
+
+extern const struct FB_FONT font8x8; /* defined in fb.c */
 
 /* jpeg.inl's parser entry, exported by jpegdec_core.c; the rest of
  * the C API is declared by JPEGDEC.h when compiled as C. */
@@ -61,18 +65,29 @@ int mjpeg_jpeg_init(JPEGIMAGE *pJPEG);
  * fill callback is invoked with 224 bytes = 112 samples per VBL. */
 #define MJPEG_SAMPLES_PER_VBL 112u
 
-/* PCM ring: 4 KB = ~0.7 s at 5600 Hz. Must be a power of two. Sized
- * to hold one full ~0.5 s ffmpeg interleave lump (2800 B) ON TOP of
- * the drain that accumulates across worst-case (~76 ms) decodes --
- * a 4 KB ring measurably underran every few lumps on hardware. */
-#define ARING_SIZE 8192u
-/* Prime ~1 s of audio before starting so the ring never runs dry
- * between ffmpeg's ~0.5 s interleave lumps. */
-#define ARING_PREFILL 5600u
+/* PCM ring. Must be a power of two. 4 KB = ~1.6 VBL at the 25 kHz DMA
+ * rate. That's ample now that tools/video_to_avi.sh interleaves audio
+ * tightly (`-max_interleave_delta 0` -> ~100 ms / 2.5 KB chunks): the
+ * demuxer buffers one small chunk at a time instead of a 0.5 s lump,
+ * so an 8 KB ring is no longer needed -- and the 4 KB saved keeps the
+ * heap clear of the settings-library boot allocation (RAM is tight;
+ * see the .uninitialized_data note in mjpeg_quant.c). */
+#define ARING_SIZE 4096u
+/* Prime ~0.5 s (YM) / ~0.12 s (DMA) before starting so the ring never
+ * runs dry between interleave chunks. Must stay below ARING_SIZE. */
+#define ARING_PREFILL 3072u
 
 /* Skip (rather than decode) a due video frame once we are this many
  * frames behind the audio clock. */
 #define MJPEG_SKIP_THRESHOLD 2u
+
+/* Ring of recent video-frame file offsets, for backward seeking (MJPEG
+ * is all-intra so any offset is a valid resume point). Power of two.
+ * 512 frames = ~20 s at 25 fps, comfortably covering a -10 s seek. */
+#define SEEK_RING 512u
+
+/* How long the time overlay stays up after a seek / pause key (us). */
+#define OVERLAY_US 2500000u
 
 /* 64-entry (vA, vB) YM volume-pair LUT from the 1988 Ghostbusters
  * demo (SAMPLE1 in GHOST.S), indexed by the top 6 bits of an unsigned
@@ -98,6 +113,8 @@ static bool s_open;
 static uint32_t s_movi_start; /* offset of the first chunk in movi */
 static uint32_t s_movi_end;   /* one past the last movi byte */
 static uint32_t s_samples_per_frame; /* audio samples per video frame */
+static uint32_t s_total_frames;      /* video frame count (0 = unknown) */
+static uint32_t s_vscale, s_vrate;   /* video fps = vrate / vscale */
 
 static uint32_t s_pos;        /* offset of the next chunk header */
 static uint32_t s_audio_pos;  /* file offset of pending audio bytes */
@@ -107,7 +124,11 @@ static uint32_t s_audio_skip; /* prefilled bytes to skip after rewind */
 static uint32_t s_frame_index; /* next frame to show, since rewind */
 static volatile uint32_t s_sample_clock; /* advanced by the fill cb */
 
-static uint32_t s_frames_shown, s_frames_skipped, s_loops;
+static bool s_paused;
+static uint32_t s_overlay_until;         /* show overlay until this us */
+static uint32_t s_frame_offsets[SEEK_RING]; /* frame index -> file offset */
+
+static uint32_t s_frames_shown, s_frames_skipped;
 static uint32_t s_decode_us; /* last decode cost, for the stats line */
 
 static uint8_t aring[ARING_SIZE];
@@ -154,6 +175,13 @@ static inline uint8_t aring_pop(void) {
  *    through the Ghostbusters (vA,vB) LUT.
  *  - SILENT (pre-report): zeros. */
 static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
+  if (s_paused) {
+    /* Silence, and DON'T advance the clock or drain the ring, so the
+     * picture and audio both resume exactly where they froze. Zero is
+     * silence for both back-ends (signed 0x00 for DMA, volume 0 YM). */
+    memset(buf, 0, bytes);
+    return;
+  }
   switch (audio_get_mode()) {
     case AUDIO_MODE_DMA:
       for (uint32_t i = 0; i < bytes; i++) {
@@ -228,21 +256,24 @@ static int rd_chunk_hdr(uint32_t off, uint32_t *fcc, uint32_t *size) {
 
 /* Walk a header LIST range looking for 'strh' chunks (any nesting). */
 static void hdrl_walk(uint32_t pos, uint32_t end, int depth, uint32_t *vscale,
-                      uint32_t *vrate, uint32_t *arate) {
+                      uint32_t *vrate, uint32_t *arate, uint32_t *vlength) {
   while (pos + 8 <= end) {
     uint32_t fcc, size;
     if (rd_chunk_hdr(pos, &fcc, &size)) return;
     uint32_t data = pos + 8;
     if (fcc == FCC_LIST && depth < 4) {
-      hdrl_walk(data + 4, data + size, depth + 1, vscale, vrate, arate);
+      hdrl_walk(data + 4, data + size, depth + 1, vscale, vrate, arate, vlength);
     } else if (fcc == FCC_STRH && size >= 28) {
-      /* AVISTREAMHEADER: fccType @0, dwScale @20, dwRate @24. */
-      uint32_t type, scale, rate;
+      /* AVISTREAMHEADER: fccType @0, dwScale @20, dwRate @24,
+       * dwLength @32 (frame count for the video stream). */
+      uint32_t type, scale, rate, length = 0;
       if (!rd_u32(data, &type) && !rd_u32(data + 20, &scale) &&
           !rd_u32(data + 24, &rate)) {
+        if (size >= 36) rd_u32(data + 32, &length);
         if (type == FCC_VIDS && rate) {
           *vscale = scale ? scale : 1;
           *vrate = rate;
+          *vlength = length;
         } else if (type == FCC_AUDS && rate) {
           *arate = rate / (scale ? scale : 1);
         }
@@ -258,7 +289,7 @@ static int avi_parse(void) {
   if (rd_u32(8, &ltype) || ltype != FCC_AVI) return -1;
   uint32_t riff_end = 8 + size;
 
-  uint32_t vscale = 1, vrate = 25, arate = 5600;
+  uint32_t vscale = 1, vrate = 25, arate = 5600, vlength = 0;
   s_movi_start = s_movi_end = 0;
 
   uint32_t pos = 12;
@@ -268,7 +299,7 @@ static int avi_parse(void) {
     if (fcc == FCC_LIST) {
       if (rd_u32(data, &ltype)) break;
       if (ltype == FCC_HDRL) {
-        hdrl_walk(data + 4, data + size, 0, &vscale, &vrate, &arate);
+        hdrl_walk(data + 4, data + size, 0, &vscale, &vrate, &arate, &vlength);
       } else if (ltype == FCC_MOVI) {
         s_movi_start = data + 4;
         s_movi_end = data + size;
@@ -283,6 +314,9 @@ static int avi_parse(void) {
   s_samples_per_frame =
       (uint32_t)(((uint64_t)arate * vscale + vrate / 2) / vrate);
   if (!s_samples_per_frame) s_samples_per_frame = 224;
+  s_vscale = vscale;
+  s_vrate = vrate;
+  s_total_frames = vlength; /* for the "cur / total" overlay */
   DPRINTF("AVI: movi %lu..%lu, %lu samples/frame (a %lu Hz, v %lu/%lu)\n",
           (unsigned long)s_movi_start, (unsigned long)s_movi_end,
           (unsigned long)s_samples_per_frame, (unsigned long)arate,
@@ -336,6 +370,42 @@ static int32_t jpg_seek(JPEGFILE *pFile, int32_t iPosition) {
   return iPosition;
 }
 
+/* --- time overlay ------------------------------------------------ */
+
+static inline bool overlay_active(void) {
+  /* Signed diff so it survives the time_us_32() wraparound. */
+  return s_paused || (int32_t)(s_overlay_until - time_us_32()) > 0;
+}
+
+/* Format a frame index as "M:SS" into out (>= 12 bytes). */
+static void fmt_time(uint32_t frame, char *out) {
+  uint32_t sec = s_vrate ? (uint32_t)(((uint64_t)frame * s_vscale) / s_vrate) : 0;
+  snprintf(out, 12, "%lu:%02lu", (unsigned long)(sec / 60u),
+           (unsigned long)(sec % 60u));
+}
+
+/* Draw "cur / total" bottom-left over the current frame. Uses the
+ * quantized palette's luminance extremes -- index 0 (darkest) for the
+ * box, 15 (lightest) for the text -- so it reads on any frame. */
+static void draw_overlay(void) {
+  char cur[12], line[28];
+  fmt_time(s_frame_index, cur);
+  if (s_total_frames) {
+    char tot[12];
+    fmt_time(s_total_frames, tot);
+    snprintf(line, sizeof(line), "%s / %s", cur, tot);
+  } else {
+    snprintf(line, sizeof(line), "%s", cur);
+  }
+  int w = (int)strlen(line) * 8 + 8;
+  fb_fill_rect(4, 183, w, 13, 0);
+  font_set_font(&font8x8);
+  font_align(FONT_ALIGN_LEFT);
+  font_set_color(15);
+  font_move(8, 185);
+  font_print(line);
+}
+
 static void decode_frame(uint32_t data, uint32_t size) {
   uint32_t t0 = time_us_32();
   memset(&s_jpg, 0, sizeof(s_jpg));
@@ -360,23 +430,11 @@ static void decode_frame(uint32_t data, uint32_t size) {
   }
   s_decode_us = time_us_32() - t0;
   mq_frame_done(); /* palette for the NEXT frame, from this frame */
+  if (overlay_active()) draw_overlay();
   fb_publish();    /* VBL-synced hand-off to the ST */
 }
 
 /* --- player ------------------------------------------------------ */
-
-static void mjpeg_rewind(void) {
-  s_pos = s_movi_start;
-  s_audio_left = 0;
-  s_frame_index = 0;
-  s_sample_clock = 0;
-  aring_head = aring_tail = 0;
-  prefill_audio();
-  s_loops++;
-  DPRINTF("MJPEG: loop %lu (shown %lu skipped %lu)\n",
-          (unsigned long)s_loops, (unsigned long)s_frames_shown,
-          (unsigned long)s_frames_skipped);
-}
 
 void mjpeg_service(void) {
   fb_pump_rom3();
@@ -412,7 +470,9 @@ int mjpeg_open(const char *path) {
   s_audio_skip = 0;
   s_frame_index = 0;
   s_sample_clock = 0;
-  s_frames_shown = s_frames_skipped = s_loops = 0;
+  s_frames_shown = s_frames_skipped = 0;
+  s_paused = false;
+  s_overlay_until = 0;
   aring_head = aring_tail = 0;
   prefill_audio();
   DPRINTF("MJPEG: primed %lu B of audio\n", (unsigned long)aring_level());
@@ -422,31 +482,41 @@ int mjpeg_open(const char *path) {
   return 0;
 }
 
-void mjpeg_tick(void) {
-  if (!s_open) return;
+void mjpeg_close(void) {
+  if (s_open) {
+    f_close(&s_fil);
+    s_open = false;
+    DPRINTF("MJPEG: closed\n");
+  }
+  /* Drain the ring so the fill callback emits silence in the menu. */
+  aring_head = aring_tail = 0;
+}
+
+bool mjpeg_tick(void) {
+  if (!s_open) return false;
+  if (s_paused) return true; /* frozen: no decode, no audio, no clock */
   for (;;) {
     /* Finish draining a partially-consumed audio chunk first. */
     if (s_audio_left) {
-      if (aring_level() >= ARING_SIZE) return; /* ring full; later */
+      if (aring_level() >= ARING_SIZE) return true; /* ring full; later */
       if (f_lseek(&s_fil, s_audio_pos) != FR_OK) {
-        mjpeg_rewind();
-        return;
+        return false; /* read error -> treat as end */
       }
       uint32_t n = aring_push_file(s_audio_left);
       s_audio_pos += n;
       s_audio_left -= n;
-      if (s_audio_left) return; /* ring filled up */
+      if (s_audio_left) return true; /* ring filled up */
       continue;
     }
 
     if (s_pos + 8 > s_movi_end) {
-      mjpeg_rewind();
-      return;
+      DPRINTF("MJPEG: end (shown %lu skipped %lu)\n",
+              (unsigned long)s_frames_shown, (unsigned long)s_frames_skipped);
+      return false; /* end of movie */
     }
     uint32_t fcc, size;
     if (rd_chunk_hdr(s_pos, &fcc, &size)) {
-      mjpeg_rewind();
-      return;
+      return false; /* read error -> treat as end */
     }
     uint32_t data = s_pos + 8;
     uint32_t next = data + size + (size & 1u);
@@ -467,9 +537,10 @@ void mjpeg_tick(void) {
       continue;
     }
     if (fcc == FCC_00DC || fcc == FCC_00DB) {
+      s_frame_offsets[s_frame_index & (SEEK_RING - 1u)] = s_pos; /* for seek */
       uint32_t due = s_sample_clock / s_samples_per_frame;
       if (due < s_frame_index) {
-        return; /* not due yet; cursor stays on this chunk */
+        return true; /* not due yet; cursor stays on this chunk */
       }
       if (due >= s_frame_index + MJPEG_SKIP_THRESHOLD) {
         s_frames_skipped++; /* behind: drop this frame, no decode */
@@ -485,8 +556,104 @@ void mjpeg_tick(void) {
       }
       s_frame_index++;
       s_pos = next;
-      return; /* at most one video frame per tick */
+      return true; /* at most one video frame per tick */
     }
     s_pos = next; /* unknown chunk (index etc.) -- skip */
   }
+}
+
+/* --- playback controls ------------------------------------------- */
+
+/* Re-sync the audio ring + master clock to the current s_frame_index /
+ * s_pos after a seek. */
+static void seek_resync_audio(void) {
+  s_audio_left = 0;
+  s_audio_skip = 0;
+  aring_head = aring_tail = 0;
+  s_sample_clock = (uint32_t)((uint64_t)s_frame_index * s_samples_per_frame);
+}
+
+void mjpeg_seek(int seconds) {
+  if (!s_open) return;
+  int32_t fps = (s_vscale && s_vrate) ? (int32_t)(s_vrate / s_vscale) : 25;
+  if (fps < 1) fps = 25;
+
+  int64_t tgt = (int64_t)s_frame_index + (int64_t)seconds * fps;
+  if (tgt < 0) tgt = 0;
+  if (s_total_frames && tgt > (int64_t)s_total_frames - 1) {
+    tgt = (int64_t)s_total_frames - 1;
+  }
+  uint32_t target = (uint32_t)tgt;
+
+  if (target < s_frame_index) {
+    /* Backward: jump to the stored offset. Clamp to what the ring still
+     * holds (a -10 s seek is well within its ~20 s window). */
+    uint32_t oldest =
+        (s_frame_index > SEEK_RING - 1u) ? (s_frame_index - (SEEK_RING - 1u)) : 0u;
+    if (target < oldest) target = oldest;
+    s_pos = s_frame_offsets[target & (SEEK_RING - 1u)];
+    s_frame_index = target;
+  } else if (target > s_frame_index) {
+    /* Forward: walk the chunk stream (headers only), recording frame
+     * offsets, until we reach the target frame or hit the end. */
+    while (s_frame_index < target && s_pos + 8 <= s_movi_end) {
+      uint32_t fcc, size;
+      if (rd_chunk_hdr(s_pos, &fcc, &size)) break;
+      uint32_t data = s_pos + 8;
+      uint32_t next = data + size + (size & 1u);
+      if (fcc == FCC_LIST) {
+        s_pos = data + 4;
+        continue;
+      }
+      if (fcc == FCC_00DC || fcc == FCC_00DB) {
+        s_frame_offsets[s_frame_index & (SEEK_RING - 1u)] = s_pos;
+        s_frame_index++;
+      }
+      s_pos = next;
+    }
+  }
+
+  seek_resync_audio();
+  s_overlay_until = time_us_32() + OVERLAY_US;
+  DPRINTF("MJPEG: seek %+ds -> frame %lu\n", seconds,
+          (unsigned long)s_frame_index);
+
+  /* While paused, redraw immediately -- the tick that would otherwise
+   * show the new frame doesn't run. (Playing: the next tick handles it.)
+   * Walk to the next video chunk without disturbing s_pos, so unpausing
+   * still resumes cleanly from the sought position. */
+  if (s_paused) {
+    uint32_t p = s_pos;
+    while (p + 8 <= s_movi_end) {
+      uint32_t fcc, size;
+      if (rd_chunk_hdr(p, &fcc, &size)) break;
+      uint32_t data = p + 8;
+      if (fcc == FCC_LIST) {
+        p = data + 4;
+        continue;
+      }
+      if ((fcc == FCC_00DC || fcc == FCC_00DB) && size) {
+        decode_frame(data, size);
+        break;
+      }
+      p = data + size + (size & 1u);
+    }
+  }
+}
+
+void mjpeg_toggle_pause(void) {
+  if (!s_open) return;
+  s_paused = !s_paused;
+  s_overlay_until = time_us_32() + OVERLAY_US;
+  DPRINTF("MJPEG: %s\n", s_paused ? "paused" : "playing");
+}
+
+bool mjpeg_is_paused(void) { return s_paused; }
+
+void mjpeg_render_paused(void) {
+  /* The chunked buffer still holds the last decoded frame (nothing
+   * overwrites it while paused); draw the overlay over it and republish
+   * at VBL rate. Idempotent -- the box redraws over the same pixels. */
+  draw_overlay();
+  fb_publish();
 }

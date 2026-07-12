@@ -8,9 +8,9 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 MD/MJPEG turns your SidecarTridge Multi-device into a video player for your Atari ST: drop an `.AVI` file onto the SD card and it plays full-screen, full-motion video with sound on a stock ST — no hard drive, no accelerator, no extra hardware.
 
-Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut + 2×2 Bayer dither, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound plays through the YM2149 at ~5.6 kHz. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
+Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut, blue-noise dither and a saturation boost, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound is 8-bit 25 kHz DMA audio on an STE, or the YM2149 (~5.6 kHz) on a plain ST — the firmware detects which machine it's on and picks the best it can do. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
 
-The app plays the first `.AVI` it finds in the `/mjpeg` folder of the SD card, loops at the end, and returns to GEM when you press **ESC**.
+When it starts, the app lists the `.AVI` files in the `/mjpeg` folder of the SD card. Use **Up/Down** to choose one and **Return** to play it. During playback, **Left/Right** skip back/forward 10 seconds, **Space** pauses and resumes, and **ESC** returns to the list (a time readout pops up briefly when you seek or pause). When a video reaches the end it returns to the list too. From the list, **ESC** quits back to GEM.
 
 ## Installation
 
@@ -45,22 +45,21 @@ The output is a normal AVI — you can preview it in VLC or any desktop player b
 
 An optional third argument sets the MJPEG quality (2 = best, 31 = worst, default 9). It's a speed dial as much as a quality dial: the RP2040 decodes every frame in real time, so _lower_ numbers make frames slower to decode and can cause dropped frames, while the ST's 16-colour dither hides most of the difference anyway. If playback looks choppy, try a higher number (e.g. 11).
 
+By default the audio is encoded at 5.6 kHz for the YM2149. If you have an STE, prefix `STE=1` (e.g. `STE=1 tools/video_to_avi.sh in.mp4 out.avi`) to encode 25 kHz audio for the STE's DMA sound chip — it still plays on a plain ST (downsampled), so it's the safe choice if any of your machines is an STE.
+
 ## Known limitations
 
 - Colour systems only (ST low-res, 320×200); high-res mono screens fall back to GEM.
-- For maximum compatibility, sound is mono, ~5.6 kHz and effectively 6-bit playing via the ST's YM2149 sound chip. Think telephone, not hi-fi.
+- Sound is mono. An STE plays 8-bit 25 kHz DMA audio; a plain ST falls back to the YM2149 (~5.6 kHz, effectively 6-bit — think telephone, not hi-fi).
 - Very busy scenes can exceed the per-frame decode budget; the player skips frames to keep the audio smooth and the picture in sync.
-- It plays the first `.AVI` it finds — there's no file selection menu.
+- The menu lists up to 20 files; no scrolling beyond that yet.
 
 ## What's next?
 
 A few ideas we've had (no promises we'll do them all):
 
-- A file selection menu for cards with more than one video
-- Pause / seek controls
 - Squeezing out the last few ms per frame for rock-solid 25 fps
 - Better audio quality modes
-- STE audio support
 
 Think you can help? Got an idea of your own? We'd love to hear from you, so why not let me know on [X](https://x.com/neilrackett) or submit a PR.
 

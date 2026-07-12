@@ -5,8 +5,8 @@
 
 /**
  * File: mjpeg_quant.c
- * Description: Per-frame 16-colour quantizer + ordered dither (4x4
- *              Bayer or 32x32 blue noise, build-selectable) for the
+ * Description: Per-frame 16-colour quantizer + ordered dither (32x32
+ *              blue noise or 2x2 Bayer, build-selectable) for the
  *              MJPEG player. See mjpeg_quant.h for the model.
  *
  * Pixel path (mq_draw, hot): RGB565 -> per-channel ordered-dither LUT
@@ -47,19 +47,26 @@
 #include "palette.h"
 #include "pico/platform.h"
 
-/* Ordered-dither pattern: 0 = 4x4 Bayer (default), 1 = 32x32 blue
- * noise (void-and-cluster). Both feed the SAME 16-level LUTs and
- * everything downstream, so this is a clean A/B of the threshold
- * PATTERN only -- regular crosshatch vs isotropic film grain. Select
- * at build time without editing source via the MQ_DITHER env var (see
- * rp/src/CMakeLists.txt): `MQ_DITHER=bluenoise ./build.sh ...`. */
+/* Ordered-dither pattern: 1 = 32x32 blue noise (void-and-cluster,
+ * default), 0 = 2x2 Bayer. Blue noise is isotropic film grain with
+ * MQ_DITHER_N distinct levels -- marginally the best-looking of the
+ * three tried on hardware; the 2x2 tile is a tighter 4-level pattern.
+ * Both feed the same LUTs and everything downstream, so this is a clean
+ * A/B of the threshold PATTERN only. Select at build time without
+ * editing source via the MQ_DITHER env var (see rp/src/CMakeLists.txt):
+ * `MQ_DITHER=bayer ./build.sh ...`. (An earlier 4x4 Bayer -- 16 levels,
+ * dottier in motion on real hardware -- is in git history if wanted.) */
 #ifndef MQ_DITHER_BLUENOISE
-#define MQ_DITHER_BLUENOISE 0
+#define MQ_DITHER_BLUENOISE 1
 #endif
 
 #if MQ_DITHER_BLUENOISE
 #include "bluenoise.h" /* const 32x32 level matrix, lives in flash */
+#define MQ_DITHER_N 16 /* blue noise quantizes to 16 threshold levels */
+#else
+#define MQ_DITHER_N 4  /* 2x2 Bayer: 4 tile positions / threshold levels */
 #endif
+#define MQ_DITHER_2N (2u * MQ_DITHER_N) /* threshold denominator scale */
 
 /* Palette temporal hysteresis. Each frame's median cut produces a
  * slightly different 16-colour palette even when the picture barely
@@ -77,6 +84,22 @@
 #define MQ_HYST_DEADBAND 1  /* hold if target within this (0..15 space)  */
 #define MQ_HYST_SNAP 160    /* sum |dchannel| over 16x3 (0..720) => snap  */
 
+/* Palette saturation + contrast boost. Median-cut palette entries are
+ * box centroids (population means), which pull toward grey and leave the
+ * palette looking washed out. With this on (default), each entry is
+ * pushed away from its own grey level (saturation) and away from
+ * mid-grey (contrast) before the luminance sort. Both gains are integer
+ * num/den (no float); tune here. MQ_SATURATE=off publishes raw centroids
+ * for an A/B. Applied to the median-cut TARGET, so hysteresis then slews
+ * toward the boosted palette exactly as before. */
+#ifndef MQ_SATURATE
+#define MQ_SATURATE 1
+#endif
+#define MQ_SAT_NUM 5  /* saturation gain 5/4 = 1.25x                      */
+#define MQ_SAT_DEN 4
+#define MQ_CON_NUM 9  /* contrast gain 9/8 = 1.125x (around mid-grey 7.5) */
+#define MQ_CON_DEN 8
+
 /* Build an ST/STE palette word from three 0..15 (RGB444) channels.
  * The STE stores each channel's low bit at the top of its nibble
  * (bits 11/7/3) and the high 3 bits in the positions the plain ST
@@ -93,28 +116,23 @@
               ((((uint16_t)(b) >> 1) & 7u) << 0) |                            \
               (((uint16_t)(b) & 1u) << 3)))
 
-/* The dither LUTs live in .uninitialized_data -- the dead gap between
- * .data and the 32 KB-aligned commemul ring at the head of .bss --
- * alongside the ~18 KB JPEGIMAGE (see mjpeg.c), so the .bss tail (and
- * thus the heap, hard-capped at the cart boundary) stays small. crt0
- * does NOT zero this section; mq_init() fills every entry before use.
- * The hole is nearly full: if a build overflows it, .bss jumps a full
- * 32 KB (ring alignment) and the LINKER fails with a RAM-overflow
- * error (not a silent bomb). Shrink the LUTs -- e.g. store 3-bit
- * values and shift at use -- rather than forcing that jump. */
-
-/* Ordered-dither LUTs, one per 4x4 Bayer position p = ((y&3)<<2)|(x&3).
+/* Ordered-dither LUTs, one per dither level: the 2x2 Bayer tile's 4
+ * positions p = ((y&1)<<1)|(x&1), or blue noise's 16 quantized levels.
  * Values are pre-shifted into their RGB333 bit positions so the inner
- * loop is just OR. 16 positions (vs 2x2's 4) give 17 tonal steps
- * between adjacent palette levels instead of 5 -- smoother gradients,
- * far less crosshatch -- at identical per-pixel cost. */
-static uint16_t __uninitialized_ram(lutR)[16][32]; /* 5-bit red -> 3, <<6 */
-static uint16_t __uninitialized_ram(lutG)[16][64]; /* 6-bit grn -> 3, <<3 */
-static uint8_t __uninitialized_ram(lutB)[16][32];  /* 5-bit blu -> 3     */
+ * loop is just OR.
+ *
+ * These sit in ordinary .bss (zeroed at boot; mq_init fills them). The
+ * .uninitialized_data hole between .data and the 32 KB-aligned commemul
+ * ring is only just big enough for the ~18 KB JPEGIMAGE alone (see
+ * mjpeg.c) -- putting the LUTs there too left almost no margin, and any
+ * later .data growth pushed the hole past the ring boundary, jumping
+ * .bss a full 32 KB and overflowing RAM. Keeping only s_jpg in the hole
+ * restores comfortable margin. */
+static uint16_t lutR[MQ_DITHER_N][32]; /* 5-bit red -> 3, <<6 */
+static uint16_t lutG[MQ_DITHER_N][64]; /* 6-bit grn -> 3, <<3 */
+static uint8_t lutB[MQ_DITHER_N][32];  /* 5-bit blu -> 3     */
 
-/* Frame histogram + palette map. Small enough for .bss (zeroed at
- * boot; mq_init / build_map fill them), kept OUT of the tight
- * .uninitialized_data hole so the larger 4x4 dither LUTs fit there. */
+/* Frame histogram + palette map (also plain .bss). */
 
 /* RGB333 histogram of the frame being decoded. 512 bins covers every
  * colour the ST can show, so no sampling error. uint16 is enough:
@@ -151,12 +169,11 @@ static inline uint8_t slew_ch(uint8_t cur, uint8_t tgt) {
 #endif
 
 #if !MQ_DITHER_BLUENOISE
-/* 4x4 Bayer matrix flattened by ((y&3)<<2)|(x&3). */
-static const uint8_t bayer[16] = {
-    0,  8,  2,  10,
-    12, 4,  14, 6,
-    3,  11, 1,  9,
-    15, 7,  13, 5,
+/* 2x2 Bayer matrix flattened by ((y&1)<<1)|(x&1). Four levels 0..3 ->
+ * thresholds (level+0.5)/4 spread across the tight 2x2 tile. */
+static const uint8_t bayer[MQ_DITHER_N] = {
+    0, 2,
+    3, 1,
 };
 #endif
 
@@ -196,25 +213,25 @@ static void publish_palette(void) {
 }
 
 void mq_init(void) {
-  /* Ordered dither: out = floor(c/cmax * 7 + (2*level+1)/32), i.e. the
-   * 16 normalized thresholds are (level+0.5)/16. Integer form:
-   * (c*7*32 + (2*level+1)*cmax) / (cmax*32). For Bayer, the LUT index
-   * IS the tile position, so bake bayer[] in (index p -> level
+  /* Ordered dither: out = floor(c/cmax * 7 + (2*level+1)/2N), i.e. the
+   * N = MQ_DITHER_N normalized thresholds are (level+0.5)/N. Integer
+   * form: (c*7*2N + (2*level+1)*cmax) / (cmax*2N). For Bayer, the LUT
+   * index IS the tile position, so bake bayer[] in (index p -> level
    * bayer[p]); for blue noise the LUT is identity (index = level) and
    * the matrix supplies each cell's level. */
-  for (unsigned p = 0; p < 16; p++) {
+  for (unsigned p = 0; p < MQ_DITHER_N; p++) {
 #if MQ_DITHER_BLUENOISE
     unsigned t = 2u * p + 1u;
 #else
     unsigned t = 2u * bayer[p] + 1u;
 #endif
     for (unsigned c = 0; c < 32; c++) {
-      unsigned v = (c * 7u * 32u + t * 31u) / (31u * 32u);
+      unsigned v = (c * 7u * MQ_DITHER_2N + t * 31u) / (31u * MQ_DITHER_2N);
       lutR[p][c] = (uint16_t)(v << 6);
       lutB[p][c] = (uint8_t)v;
     }
     for (unsigned c = 0; c < 64; c++) {
-      unsigned v = (c * 7u * 32u + t * 63u) / (63u * 32u);
+      unsigned v = (c * 7u * MQ_DITHER_2N + t * 63u) / (63u * MQ_DITHER_2N);
       lutG[p][c] = (uint16_t)(v << 3);
     }
   }
@@ -280,14 +297,15 @@ int __not_in_flash_func(mq_draw)(JPEGDRAW *pDraw) {
         d[i] = map9[c];
       }
 #else
-      /* Four Bayer columns for this row (4x4 matrix). rL[k] is the LUT
-       * for screen column x0+k; since the inner loop steps by 4 from a
-       * multiple of 4, pixel i+k always has phase k. */
-      unsigned base = (unsigned)((y & 3) << 2);
+      /* Bayer LUT per screen column for this row (2x2 tile: row phase
+       * (y&1), column phase (x&1)). We precompute 4 columns and the
+       * inner loop steps by 4, so with the 2-periodic tile rL[0]==rL[2]
+       * and rL[1]==rL[3]; pixel i+k (i a multiple of 4) has phase k. */
+      unsigned base = (unsigned)((y & 1) << 1);
       const uint16_t *rL[4], *gL[4];
       const uint8_t *bL[4];
       for (unsigned k = 0; k < 4; k++) {
-        unsigned p = base | ((unsigned)(x0 + (int)k) & 3u);
+        unsigned p = base | ((unsigned)(x0 + (int)k) & 1u);
         rL[k] = lutR[p];
         gL[k] = lutG[p];
         bL[k] = lutB[p];
@@ -383,6 +401,28 @@ static uint32_t box_slice(const box_t *bx, int axis, unsigned v) {
   }
   return n;
 }
+
+#if MQ_SATURATE
+static inline uint8_t clamp15(int v) {
+  return (uint8_t)(v < 0 ? 0 : (v > 15 ? 15 : v));
+}
+
+/* Push one 0..15 RGB444 palette entry away from grey (saturation) and
+ * away from mid-grey (contrast), countering the centroid wash-out. Luma
+ * uses the same 3:6:1 weighting as the luminance sort. Worked doubled
+ * internally so the 7.5 mid-grey and half-step gains stay exact. */
+static void boost_entry(uint8_t *pr, uint8_t *pg, uint8_t *pb) {
+  int r = *pr, g = *pg, b = *pb;
+  int luma = (3 * r + 6 * g + b + 5) / 10;
+  int lc2 = 15 + (2 * luma - 15) * MQ_CON_NUM / MQ_CON_DEN; /* 2x contrast(luma) */
+  int r2 = lc2 + 2 * (r - luma) * MQ_SAT_NUM / MQ_SAT_DEN;
+  int g2 = lc2 + 2 * (g - luma) * MQ_SAT_NUM / MQ_SAT_DEN;
+  int b2 = lc2 + 2 * (b - luma) * MQ_SAT_NUM / MQ_SAT_DEN;
+  *pr = clamp15((r2 + 1) / 2);
+  *pg = clamp15((g2 + 1) / 2);
+  *pb = clamp15((b2 + 1) / 2);
+}
+#endif
 
 void mq_frame_done(void) {
   box_t boxes[PALETTE_ENTRIES];
@@ -483,6 +523,11 @@ void mq_frame_done(void) {
     tg[i] = (uint8_t)((sg * 15u + den / 2u) / den);
     tb[i] = (uint8_t)((sb * 15u + den / 2u) / den);
   }
+#if MQ_SATURATE
+  for (unsigned i = 0; i < nb; i++) {
+    boost_entry(&tr[i], &tg[i], &tb[i]);
+  }
+#endif
   for (unsigned i = nb; i < PALETTE_ENTRIES; i++) {
     tr[i] = tr[nb - 1];
     tg[i] = tg[nb - 1];

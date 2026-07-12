@@ -92,6 +92,12 @@ bool ikbd_pop_key(ikbd_key_event_t *out);
  * the setting. */
 void ikbd_set_esc_auto_exit(bool enabled);
 
+/* Request a clean exit to GEM by writing CART_CMD_BOOT_GEM to the cart
+ * command sentinel (the same thing the built-in ESC handler does). For
+ * apps that own the ESC key (ikbd_set_esc_auto_exit(false)) and decide
+ * for themselves when to quit -- e.g. ESC from a top-level menu. */
+void ikbd_request_boot_gem(void);
+
 #ifdef __cplusplus
 }
 #endif

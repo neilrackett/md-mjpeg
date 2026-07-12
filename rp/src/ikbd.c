@@ -95,6 +95,14 @@ void ikbd_set_esc_auto_exit(bool enabled) {
   s_esc_auto_exit = enabled;
 }
 
+void ikbd_request_boot_gem(void) {
+  /* Pre-swap the longword halves so the m68k's move.l reads the
+   * expected value across the cart-bus byte order (cart_asM68kLong). */
+  *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
+                          CART_CMD_SENTINEL_OFFSET)) =
+      cart_asM68kLong(CART_CMD_BOOT_GEM);
+}
+
 size_t ikbd_ring_count(void) {
   uint8_t h = s_head;
   uint8_t t = s_tail;
@@ -134,9 +142,7 @@ static void push_key(uint8_t scancode, bool is_press) {
       s_esc_press_us = 0;
       if (s_esc_auto_exit && press != 0u &&
           (time_us_32() - press) < IKBD_ESC_RELEASE_TIMEOUT_US) {
-        *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
-                                CART_CMD_SENTINEL_OFFSET)) =
-            cart_asM68kLong(CART_CMD_BOOT_GEM);
+        ikbd_request_boot_gem();
       }
     }
   }

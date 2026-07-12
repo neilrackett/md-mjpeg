@@ -6,6 +6,15 @@ APP_UUID_KEY_RESOLVED := $(if $(strip $(APP_UUID_KEY)),$(strip $(APP_UUID_KEY)),
 UART_BAUD ?= 115200
 UART_DEV ?=
 
+# Build options: prepend as env vars to `make build`. Unset = the
+# default shown. Combine freely, e.g.
+#   MQ_DITHER=bayer MQ_SATURATE=off make build
+#
+#   MQ_DITHER=bayer     2x2 Bayer dither         (default: 32x32 blue noise)
+#   MQ_HYSTERESIS=off   raw per-frame palette    (default: temporal slew on)
+#   MQ_SATURATE=off     raw median-cut colours   (default: sat + contrast boost)
+#   FORCE_NO_DMA=1      force YM audio fallback   (default: auto-detect STE DMA)
+
 export STCMD_NO_TTY=1
 
 ## Build production firmware for pico_w using APP_UUID_KEY env var, then uuid.txt, then default

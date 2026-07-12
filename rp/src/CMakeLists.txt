@@ -119,6 +119,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         hw_config.c
         jpegdec_core.c
         mjpeg.c
+        mjpeg_menu.c
         mjpeg_quant.c
         palette.c
         reset.c
@@ -136,15 +137,15 @@ set_source_files_properties(jpegdec_core.c mjpeg.c mjpeg_quant.c
     PROPERTIES COMPILE_DEFINITIONS __MCUXPRESSO)
 
 # Ordered-dither pattern A/B select (no source edit needed):
-#   MQ_DITHER=bluenoise ./build.sh ...   -> 32x32 blue noise
-#   (anything else / unset)              -> 4x4 Bayer (default)
+#   MQ_DITHER=bayer ./build.sh ...   -> 2x2 Bayer
+#   (anything else / unset)          -> 32x32 blue noise (default)
 # Appended to mjpeg_quant.c's definitions so __MCUXPRESSO is kept.
-if("$ENV{MQ_DITHER}" STREQUAL "bluenoise")
-    message(STATUS "Dither pattern: blue noise (MQ_DITHER_BLUENOISE=1)")
+if("$ENV{MQ_DITHER}" STREQUAL "bayer")
+    message(STATUS "Dither pattern: 2x2 Bayer (MQ_DITHER_BLUENOISE=0)")
     set_property(SOURCE mjpeg_quant.c APPEND PROPERTY
-        COMPILE_DEFINITIONS MQ_DITHER_BLUENOISE=1)
+        COMPILE_DEFINITIONS MQ_DITHER_BLUENOISE=0)
 else()
-    message(STATUS "Dither pattern: 4x4 Bayer (default)")
+    message(STATUS "Dither pattern: blue noise (default)")
 endif()
 
 # Palette temporal hysteresis (on by default). Build MQ_HYSTERESIS=off
@@ -155,6 +156,17 @@ if("$ENV{MQ_HYSTERESIS}" STREQUAL "off")
         COMPILE_DEFINITIONS MQ_HYSTERESIS=0)
 else()
     message(STATUS "Palette hysteresis: ON (default)")
+endif()
+
+# Palette saturation + contrast boost (on by default) -- counters the
+# median-cut centroid averaging that washes colour out. MQ_SATURATE=off
+# publishes the raw centroids (for A/B).
+if("$ENV{MQ_SATURATE}" STREQUAL "off")
+    message(STATUS "Palette saturation boost: OFF (MQ_SATURATE=0)")
+    set_property(SOURCE mjpeg_quant.c APPEND PROPERTY
+        COMPILE_DEFINITIONS MQ_SATURATE=0)
+else()
+    message(STATUS "Palette saturation boost: ON (default)")
 endif()
 
 # Audio back-end is auto-detected at runtime (STE DMA vs YM), reported

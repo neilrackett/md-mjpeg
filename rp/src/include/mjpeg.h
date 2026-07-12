@@ -31,6 +31,7 @@
 #ifndef MJPEG_H_INCLUDED
 #define MJPEG_H_INCLUDED
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -42,16 +43,41 @@ extern "C" {
  * success, negative on failure (open/parse error). */
 int mjpeg_open(const char *path);
 
+/* Stop playback: close the file and drain the audio ring to silence.
+ * Safe to call when nothing is open. Call before opening another file
+ * (mjpeg_open refuses while one is already open). */
+void mjpeg_close(void);
+
 /* Advance the player: buffer audio chunks, and decode+publish (or
  * skip) at most one video frame. Call once per main-loop iteration.
- * Returns quickly when no frame is due. Loops the file at EOF. */
-void mjpeg_tick(void);
+ * Returns quickly when no frame is due. Returns true while the movie
+ * is still playing, false once it reaches the end (or on an
+ * unrecoverable error / when nothing is open) -- the caller then
+ * closes and returns to the menu. */
+bool mjpeg_tick(void);
 
 /* Keep the platform alive during long operations: drains the ROM3
  * ring (IKBD + VBL sync) and refills the cart audio buffer. Called
  * from the JPEG draw callback every few MCU rows so audio never
  * underruns during a ~30 ms decode. Safe to call at any time. */
 void mjpeg_service(void);
+
+/* --- playback controls ------------------------------------------- */
+
+/* Seek `seconds` relative to the current position (negative = back).
+ * MJPEG is all-intra so any frame is a valid target: forward walks the
+ * chunk stream, backward uses a small ring of recent frame offsets.
+ * Clamped to the movie bounds and briefly shows the time overlay. */
+void mjpeg_seek(int seconds);
+
+/* Toggle play/pause. Paused freezes the picture, silences the audio,
+ * and keeps the time overlay up. */
+void mjpeg_toggle_pause(void);
+bool mjpeg_is_paused(void);
+
+/* Redraw the frozen frame with the time overlay and publish it. Call
+ * once per loop iteration while paused, in place of mjpeg_tick(). */
+void mjpeg_render_paused(void);
 
 /* Frames successfully decoded+published since open (across loops). */
 uint32_t mjpeg_frames_shown(void);

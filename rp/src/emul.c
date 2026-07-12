@@ -10,9 +10,11 @@
  *              quantized 16-colour palette and YM2149 audio.
  *
  * Boot block (cart bus, framebuffer, SD, SELECT) is the template's;
- * the app is mjpeg.c / mjpeg_quant.c driven from the main loop. The
- * first .AVI found in the app folder is played on loop; ESC exits to
- * GEM (default ikbd.c behaviour).
+ * the app is mjpeg.c / mjpeg_quant.c / mjpeg_menu.c driven from the
+ * main loop, a MENU <-> PLAYING state machine: the menu lists the
+ * .AVI files in the app folder; Up/Down + Return picks one to play;
+ * ESC backs out of a video to the menu, and quits to GEM from the
+ * menu.
  */
 
 #include "emul.h"
@@ -32,6 +34,7 @@
 #include "ikbd.h"
 #include "memfunc.h"
 #include "mjpeg.h"
+#include "mjpeg_menu.h"
 #include "palette.h"
 #include "pico/stdlib.h"
 #include "romemul.h"
@@ -57,23 +60,6 @@ static bool cart_check(const char *stage) {
             c[1], c[2], c[3]);
   }
   return ok;
-}
-
-/* Centered status line on a black screen (used when there is nothing
- * to play -- the video path never draws text). */
-static void show_status(const char *line1, const char *line2) {
-  fb_chunked_clear(15);
-  font_set_font(&font8x8);
-  font_set_color(0);
-  font_align(FONT_ALIGN_CENTER);
-  font_move(FB_CHUNKED_W / 2, 88);
-  font_print(line1);
-  if (line2) {
-    font_move(FB_CHUNKED_W / 2, 104);
-    font_print(line2);
-  }
-  font_align(FONT_ALIGN_LEFT);
-  fb_publish();
 }
 
 void emul_start() {
@@ -123,84 +109,101 @@ void emul_start() {
 
   select_configure();
 
-  /* --- find and open the first .AVI: app folder first, then root --- */
-  bool playing = false;
-  if (sd_ok) {
-    static char path[300];
-    static char msg[80];
-    /* Configured folder first, then the app's canonical folder, then
-     * the card root -- the config sector can hold a stale FOLDER (it
-     * is only as trustworthy as the last app that saved it). */
-    const char *dirs[3] = {folderName, "/mjpeg", "/"};
-    FRESULT fr[3] = {FR_OK, FR_OK, FR_OK};
-    path[0] = '\0';
-    for (int i = 0; i < 3 && path[0] == '\0'; i++) {
-      DIR dir;
-      FILINFO fno;
-      fr[i] = f_findfirst(&dir, &fno, dirs[i], "*.AVI");
-      if (fr[i] == FR_OK && fno.fname[0] != '\0') {
-        snprintf(path, sizeof(path), "%s/%s",
-                 (dirs[i][1] == '\0') ? "" : dirs[i], fno.fname);
-      }
-      f_closedir(&dir);
-    }
-    if (path[0] != '\0') {
-      /* Breadcrumb: visible on the ST while the AVI is opened/parsed,
-       * so a stall inside the open path can be told apart from a
-       * stall before it (screen would still show the boot pattern). */
-      snprintf(msg, sizeof(msg), "OPENING %s", path);
-      show_status("MD/MJPEG " RELEASE_VERSION, msg);
-      playing = mjpeg_open(path) == 0;
-      if (!playing) {
-        snprintf(msg, sizeof(msg), "CANNOT PLAY %s", path);
-        show_status("MD/MJPEG " RELEASE_VERSION, msg);
-      }
-    } else {
-      /* Show exactly where we looked + the FatFs result codes, so a
-       * misconfigured FOLDER (per-app flash config) is visible on the
-       * ST screen without needing the UART console. */
-      DPRINTF("No .AVI found in %s (fr=%d), /mjpeg (fr=%d) or / (fr=%d)\n",
-              folderName, fr[0], fr[1], fr[2]);
-      snprintf(msg, sizeof(msg), "NO .AVI IN %s (FR %d) /mjpeg (FR %d) / (FR %d)",
-               folderName, fr[0], fr[1], fr[2]);
-      show_status("MD/MJPEG " RELEASE_VERSION, msg);
-    }
-  } else {
-    show_status("MD/MJPEG " RELEASE_VERSION, "NO SD CARD");
-  }
-  cart_check("post-open");
+  /* The menu owns the ESC key: ESC backs out of a playing video to the
+   * menu, and quits to GEM only from the top-level menu. */
+  ikbd_set_esc_auto_exit(false);
+  mjpeg_menu_init(sd_ok ? folderName : "/");
+  cart_check("post-menu-init");
+
+  /* IKBD make scancodes. */
+  enum {
+    SC_ESC = 0x01,
+    SC_SPACE = 0x39,
+    SC_RETURN = 0x1C,
+    SC_UP = 0x48,
+    SC_DOWN = 0x50,
+    SC_LEFT = 0x4B,
+    SC_RIGHT = 0x4D,
+    SC_KP_ENTER = 0x72,
+  };
+  enum { STATE_MENU, STATE_PLAYING } state = STATE_MENU;
+  int sel = 0;
 
   /* --- main loop --- */
-  DPRINTF("Entering main loop\n");
-  uint32_t stall_last_shown = 0;
-  uint32_t stall_check_us = time_us_32();
+  DPRINTF("Entering main loop (%d file(s))\n", mjpeg_menu_count());
+  uint32_t hb_us = time_us_32();
   while (true) {
     fb_pump_rom3(); /* ROM3 ring -> IKBD demux + VBL frame-sync */
     ikbd_pump();
 
     ikbd_key_event_t k;
     while (ikbd_pop_key(&k)) {
-      /* ESC exit to GEM is handled inside ikbd.c; nothing else yet. */
-      (void)k;
+      if (!k.is_press) {
+        continue;
+      }
+      int n = mjpeg_menu_count();
+      if (state == STATE_MENU) {
+        switch (k.scancode) {
+          case SC_UP:
+            if (n) sel = (sel + n - 1) % n;
+            break;
+          case SC_DOWN:
+            if (n) sel = (sel + 1) % n;
+            break;
+          case SC_RETURN:
+          case SC_KP_ENTER:
+            if (n) {
+              mjpeg_close();
+              if (mjpeg_open(mjpeg_menu_path(sel)) == 0) {
+                state = STATE_PLAYING;
+              }
+            }
+            break;
+          case SC_ESC:
+            ikbd_request_boot_gem(); /* quit to GEM */
+            break;
+          default:
+            break;
+        }
+      } else { /* STATE_PLAYING */
+        switch (k.scancode) {
+          case SC_ESC:
+            mjpeg_close();
+            state = STATE_MENU;
+            break;
+          case SC_LEFT:
+            mjpeg_seek(-10);
+            break;
+          case SC_RIGHT:
+            mjpeg_seek(10);
+            break;
+          case SC_SPACE:
+            mjpeg_toggle_pause();
+            break;
+          default:
+            break;
+        }
+      }
     }
 
-    if (playing) {
-      mjpeg_tick();
-      /* Stall detector: if no frame lands for 3 s, paint the player
-       * counters on the ST screen -- on-target diagnostics that work
-       * in release builds where the UART console is compiled out. */
-      uint32_t now = time_us_32();
-      if (now - stall_check_us > 3000000u) {
-        stall_check_us = now;
-        uint32_t shown = mjpeg_frames_shown();
-        static char dbg[64];
-        mjpeg_debug_status(dbg, sizeof(dbg));
-        DPRINTF("HB: %s\n", dbg); /* liveness heartbeat on the UART */
-        if (shown == stall_last_shown) {
-          show_status("MD/MJPEG STALLED", dbg);
+    if (state == STATE_PLAYING) {
+      if (mjpeg_is_paused()) {
+        mjpeg_render_paused(); /* frozen frame + overlay, VBL-paced */
+      } else if (mjpeg_tick()) {
+        uint32_t now = time_us_32();
+        if (now - hb_us > 3000000u) { /* UART liveness heartbeat */
+          hb_us = now;
+          static char dbg[64];
+          mjpeg_debug_status(dbg, sizeof(dbg));
+          DPRINTF("HB: %s\n", dbg);
         }
-        stall_last_shown = shown;
+      } else {
+        /* Reached the end -- stop and return to the menu. */
+        mjpeg_close();
+        state = STATE_MENU;
       }
+    } else {
+      mjpeg_menu_render(sel); /* draws + publishes, VBL-paced */
     }
     audio_render_frame();
     cart_check("main-loop");
