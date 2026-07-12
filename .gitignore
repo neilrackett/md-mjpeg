@@ -66,6 +66,7 @@ __pycache__/
 *.pyc
 
 # Local media + demo-strip backup (never commit)
+test-videos/
 *.mp4
 *.avi
 *.AVI

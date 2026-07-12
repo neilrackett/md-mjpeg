@@ -44,21 +44,37 @@ IN="$1"
 OUT="${2:-${IN%.*}.avi}"
 QUALITY="${3:-9}"
 FPS=25
-AUDIO_RATE=5600   # must match the m68k Timer-B consumption rate
+
+# Audio target. Default = 5600 Hz for the YM2149 path. STE=1 selects
+# 25033 Hz for the STE DMA-sound path (the universal firmware also
+# plays this rate on a plain ST by downsampling, so 25 kHz is the
+# right choice if you have an STE-capable build).
+if [ "${STE:-0}" = "1" ]; then
+  AUDIO_RATE=25033
+else
+  AUDIO_RATE=5600
+fi
 
 if [ "$IN" = "$OUT" ]; then
   echo "error: output would overwrite input ($IN)" >&2
   exit 1
 fi
 
-# Centre crop-fill to 16:10, then scale to 320x200. The crop keeps
-# whichever dimension already fits and trims the other, so any input
-# aspect ratio fills the frame with no letterboxing.
+# Notes on the flags that matter for smooth playback:
+#  - `-max_interleave_delta 0`: force TIGHT audio/video interleaving.
+#    Without it ffmpeg writes audio in ~0.5 s lumps; the firmware's
+#    ~0.33 s audio ring can't hold one, so the demuxer stalls on each
+#    lump and the video visibly stutters. Tight interleave -> ~100 ms
+#    audio chunks that fit the ring.
+#  - `loudnorm` (not dynaudnorm): dynaudnorm pumps the gain up in quiet
+#    passages, amplifying the noise floor -- very audible on the 8/6-bit
+#    output. loudnorm (EBU R128) normalises without that pumping.
 ffmpeg -y -hide_banner -i "$IN" \
   -vf "fps=${FPS},crop='min(iw,ih*8/5)':'min(ih,iw*5/8)',scale=320:200:flags=lanczos,hqdn3d=3:2:6:4" \
   -c:v mjpeg -q:v "$QUALITY" -pix_fmt yuvj420p \
-  -ac 1 -af dynaudnorm -ar "$AUDIO_RATE" -c:a pcm_u8 \
+  -ac 1 -af "loudnorm=I=-16:TP=-1.5" -ar "$AUDIO_RATE" -c:a pcm_u8 \
+  -max_interleave_delta 0 \
   "$OUT"
 
 echo
-echo "Wrote $OUT -- copy it to the SD card app folder (default /mjpeg)."
+echo "Wrote $OUT (${AUDIO_RATE} Hz audio) -- copy it to the SD card app folder (default /mjpeg)."

@@ -12,10 +12,6 @@ Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh
 
 The app plays the first `.AVI` it finds in the `/mjpeg` folder of the SD card, loops at the end, and returns to GEM when you press **ESC**.
 
-### Why Motion MJPEG (MJPEG)?
-
-MJPEG was chosen because it's a perfect fit for the SidecarT's hardware constraints: each frame is a self-contained JPEG image that can be decoded independently without requiring complex motion prediction or reference frames. This means the RP2040 can stream video at 25 fps by simply decoding one JPEG per frame, which is far simpler and more reliable than full-motion codecs like H264 or H265 that need to maintain state between frames.
-
 ## Installation
 
 1. Download the latest files from the releases page.
@@ -23,6 +19,10 @@ MJPEG was chosen because it's a perfect fit for the SidecarT's hardware constrai
 3. On the Booster screen, press ESC for the app list and select the MD/MJPEG app.
 4. Copy a converted `.AVI` file (see below) into the `/mjpeg` folder of the SD card.
 5. To return to Booster, power on while holding SELECT.
+
+### Why Motion MJPEG (MJPEG)?
+
+MJPEG was chosen because it's a perfect fit for the SidecarT's hardware constraints: each frame is a self-contained JPEG image that can be decoded independently without requiring complex motion prediction or reference frames. This means the RP2040 can stream video at 25 fps by simply decoding one JPEG per frame, which is far simpler and more reliable than full-motion codecs like H264 or H265 that need to maintain state between frames.
 
 ## Converting a video
 
