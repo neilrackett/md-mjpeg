@@ -10,7 +10,11 @@ MD/MJPEG turns your SidecarTridge Multi-device into a video player for your Atar
 
 Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut + 2×2 Bayer dither, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound plays through the YM2149 at ~5.6 kHz. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
 
-The app plays the first `.AVI` it finds in the `/mjpeg` folder of the SD card (configurable in Booster), loops at the end, and returns to GEM when you press **ESC**.
+The app plays the first `.AVI` it finds in the `/mjpeg` folder of the SD card, loops at the end, and returns to GEM when you press **ESC**.
+
+### Why Motion MJPEG (MJPEG)?
+
+MJPEG was chosen because it's a perfect fit for the SidecarT's hardware constraints: each frame is a self-contained JPEG image that can be decoded independently without requiring complex motion prediction or reference frames. This means the RP2040 can stream video at 25 fps by simply decoding one JPEG per frame, which is far simpler and more reliable than full-motion codecs like H264 or H265 that need to maintain state between frames.
 
 ## Installation
 

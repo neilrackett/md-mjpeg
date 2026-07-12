@@ -135,6 +135,28 @@ target_sources(${PROJECT_NAME} PRIVATE
 set_source_files_properties(jpegdec_core.c mjpeg.c mjpeg_quant.c
     PROPERTIES COMPILE_DEFINITIONS __MCUXPRESSO)
 
+# Ordered-dither pattern A/B select (no source edit needed):
+#   MQ_DITHER=bluenoise ./build.sh ...   -> 32x32 blue noise
+#   (anything else / unset)              -> 4x4 Bayer (default)
+# Appended to mjpeg_quant.c's definitions so __MCUXPRESSO is kept.
+if("$ENV{MQ_DITHER}" STREQUAL "bluenoise")
+    message(STATUS "Dither pattern: blue noise (MQ_DITHER_BLUENOISE=1)")
+    set_property(SOURCE mjpeg_quant.c APPEND PROPERTY
+        COMPILE_DEFINITIONS MQ_DITHER_BLUENOISE=1)
+else()
+    message(STATUS "Dither pattern: 4x4 Bayer (default)")
+endif()
+
+# Palette temporal hysteresis (on by default). Build MQ_HYSTERESIS=off
+# to reproduce the raw per-frame palette (for A/B against the shimmer).
+if("$ENV{MQ_HYSTERESIS}" STREQUAL "off")
+    message(STATUS "Palette hysteresis: OFF (MQ_HYSTERESIS=0)")
+    set_property(SOURCE mjpeg_quant.c APPEND PROPERTY
+        COMPILE_DEFINITIONS MQ_HYSTERESIS=0)
+else()
+    message(STATUS "Palette hysteresis: ON (default)")
+endif()
+
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
 

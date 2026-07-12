@@ -33,7 +33,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | File | Role |
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
-| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback |
+| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram stay RGB333, so distinct-level count (esp. greyscale) is unchanged. A true colour-count win needs an RGB444 histogram/dither — blocked by the `.uninitialized_data` hole size (lesson 4). |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop, stall detector, cart-corruption canary |
 | `tools/video_to_avi.sh` | ffmpeg wrapper producing the AVI format contract |
@@ -63,6 +63,21 @@ make tag       # tag HEAD with version.txt and push (release workflow)
   that diff is expected).
 - Bump `version.txt` (`v0.x.y`) for every flashed build — it shows in the
   UART banner and on-screen status line and makes hardware reports traceable.
+- **Dither A/B flag**: `MQ_DITHER=bluenoise ./build.sh ...` (or `MQ_DITHER=bluenoise make build`)
+  builds the 32×32 blue-noise dither; unset/anything else = 4×4 Bayer (default).
+  Read as an env var in `rp/src/CMakeLists.txt` → `MQ_DITHER_BLUENOISE` define on
+  `mjpeg_quant.c`. The blue-noise matrix (`rp/src/include/bluenoise.h`, `const` →
+  flash, regenerate with `python3 tools/gen_bluenoise.py`) quantizes to the same 16
+  levels as Bayer and shares all the LUTs, so both cost the same and differ only in
+  threshold pattern. `build.sh` wipes `dist/` each run, so to keep both UF2s copy
+  each out under a distinct name between builds.
+- **Palette hysteresis flag**: on by default; `MQ_HYSTERESIS=off ./build.sh ...`
+  builds the raw per-frame palette. Same env→define wiring in CMakeLists →
+  `MQ_HYSTERESIS` in `mjpeg_quant.c`. On, `mq_frame_done` slews the published
+  palette toward each frame's median-cut target (≤`MQ_HYST_STEP`/channel, holding
+  within `MQ_HYST_DEADBAND`) and snaps when the whole-palette change exceeds
+  `MQ_HYST_SNAP` (a scene cut) — kills the frame-to-frame shimmer/"pumping" that
+  reads as banding in motion. Tune the three constants at the top of the file.
 - There is no test suite. Verification = build + UF2 on hardware + UART
   console + on-screen diagnostics. Offline validation patterns that worked:
   compile `jpeg.inl` + the exact decode/draw code as a host binary against
@@ -118,9 +133,16 @@ Things that cost real debugging time. Do not re-learn them.
    alignment and the commemul ring needs 32 KB alignment, `.bss` starts at
    `0x20008000` leaving a **~22 KB dead gap** after `.data`. Park large
    buffers there with pico-sdk's `__uninitialized_ram(name)` (JPEGIMAGE
-   `s_jpg` ~18 KB + the quantizer tables live there now). Rules: contents
+   `s_jpg` ~18 KB + the 4x4 dither LUTs live there now). Rules: contents
    are NOT zeroed at boot (initialize explicitly), and the gap contents must
-   stay below `0x20008000` or `.bss` jumps 32 KB.
+   stay below `0x20008000` or `.bss` jumps 32 KB. **The gap is nearly full
+   — ~144 B spare after the 4x4 Bayer LUTs**; `hist`/`map9` were pushed to
+   `.bss` to make room. Overflowing it is caught by the linker (`.bss will
+   not fit in region RAM`), NOT silent — but the build script still prints
+   "Build completed successfully" on a failed RP link, so after any static
+   growth verify `[100%] Built target rp` / `Linking ... rp.elf` appeared
+   and re-check `__bss_end__` in the map. To grow the LUTs, store 3-bit
+   values and shift at use (halves them) rather than forcing the 32 KB jump.
 
 5. **Debug builds lose the cartridge boot race.** `DEBUG_MODE=1` prints
    ~6 KB of settings/lookup dumps at 115200 baud *before* `emul_start()`

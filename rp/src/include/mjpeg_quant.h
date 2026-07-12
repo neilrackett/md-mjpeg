@@ -8,8 +8,9 @@
  * Description: Per-frame 16-colour quantizer for the MJPEG player.
  *
  * mq_draw() is the JPEGDEC draw callback: it converts each RGB565
- * band to ST RGB333 with a 2x2 Bayer ordered dither, accumulates an
- * RGB333 histogram, and maps every pixel to a palette index straight
+ * band to ST RGB333 with an ordered dither (4x4 Bayer by default, or
+ * 32x32 blue noise -- build-selectable, see mjpeg_quant.c), accumulates
+ * an RGB333 histogram, and maps every pixel to a palette index straight
  * into fb_chunked_buffer.
  *
  * mq_frame_done() runs a median cut over the histogram to produce the
@@ -17,7 +18,15 @@
  * rebuilds the 512-entry RGB333 -> palette-index map. The palette
  * therefore lags the content by one frame -- invisible at 25 fps
  * except for a single-frame glitch on hard scene cuts, and it avoids
- * decoding every JPEG twice.
+ * decoding every JPEG twice. Temporal hysteresis (on by default) then
+ * slews the published palette toward that target so it doesn't shimmer
+ * frame-to-frame, snapping on scene cuts -- see mjpeg_quant.c.
+ *
+ * The palette entries are RGB444 (0..15/channel), published in STE
+ * encoding so a plain ST reads the RGB333 truncation of the same word
+ * (one palette, both machines, no detection). This gives STE finer
+ * colour placement, not more simultaneous colours -- the dither and
+ * histogram remain RGB333. See mjpeg_quant.c.
  */
 
 #ifndef MJPEG_QUANT_H_INCLUDED
