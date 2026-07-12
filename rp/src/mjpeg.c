@@ -77,7 +77,8 @@ int mjpeg_jpeg_init(JPEGIMAGE *pJPEG);
 /* 64-entry (vA, vB) YM volume-pair LUT from the 1988 Ghostbusters
  * demo (SAMPLE1 in GHOST.S), indexed by the top 6 bits of an unsigned
  * 8-bit PCM sample. Same table as tools/wav_to_ym4.py --mode
- * dual-ghost; the m68k Timer-B handler plays exactly this layout. */
+ * dual-ghost; the m68k Timer-B handler plays exactly this layout.
+ * Used by the YM (downsampled) fill path. */
 static const uint8_t ghost_lut[64][2] = {
     {0, 0},  {0, 2},  {1, 2},  {2, 2},  {2, 3},  {1, 4},  {2, 4},  {2, 5},
     {0, 6},  {2, 6},  {3, 6},  {4, 6},  {2, 7},  {4, 7},  {5, 7},  {2, 8},
@@ -126,23 +127,63 @@ static uint32_t s_jpg_base; /* file offset of the JPEG being decoded */
 
 static inline uint32_t aring_level(void) { return aring_head - aring_tail; }
 
-/* Per-VBL fill callback (audio.c): pop one PCM byte per sample, map
- * through the Ghostbusters LUT, always advance the sample clock --
- * silence counts as time, which is what lets video start before the
- * first audio chunk and keep pacing across underruns. */
-static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
-  uint32_t samples = bytes / 2u;
-  for (uint32_t i = 0; i < samples; i++) {
-    uint8_t s = 0x80; /* PCM midpoint = silence */
-    if (aring_head != aring_tail) {
-      s = aring[aring_tail & (ARING_SIZE - 1u)];
-      aring_tail++;
-    }
-    const uint8_t *pair = ghost_lut[s >> 2];
-    *buf++ = pair[0];
-    *buf++ = pair[1];
+/* Source PCM samples consumed per VBL = the 25 kHz source rate / 50 Hz
+ * VBL. Both back-ends consume this many source samples (DMA 1:1, YM
+ * downsampled), so video pacing (s_sample_clock) is identical either
+ * way and A/V stays locked regardless of which path is active. */
+#define MJPEG_SRC_PER_VBL 500u
+
+/* Pop one unsigned source PCM sample; 0x80 (silence) on underrun. */
+static inline uint8_t aring_pop(void) {
+  uint8_t s = 0x80;
+  if (aring_head != aring_tail) {
+    s = aring[aring_tail & (ARING_SIZE - 1u)];
+    aring_tail++;
   }
-  s_sample_clock += samples;
+  return s;
+}
+
+/* Per-VBL fill callback (audio.c). Produces the format matching the
+ * runtime audio mode, then advances the sample clock by one VBL of
+ * source samples (silence counts as time, so video keeps pacing
+ * before the first audio and across underruns):
+ *  - DMA: signed-PCM passthrough. AVI stores unsigned (silence 0x80),
+ *    the DMA wants signed (silence 0x00) -> flip the top bit.
+ *  - YM: box-average MJPEG_SRC_PER_VBL source samples down to bytes/2
+ *    outputs (~4.46:1 for a 25 kHz source on a plain ST), each mapped
+ *    through the Ghostbusters (vA,vB) LUT.
+ *  - SILENT (pre-report): zeros. */
+static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
+  switch (audio_get_mode()) {
+    case AUDIO_MODE_DMA:
+      for (uint32_t i = 0; i < bytes; i++) {
+        *buf++ = (uint8_t)(aring_pop() ^ 0x80u);
+      }
+      break;
+    case AUDIO_MODE_YM: {
+      uint32_t outs = bytes / 2u;
+      uint32_t done = 0;
+      for (uint32_t i = 0; i < outs; i++) {
+        uint32_t next = ((i + 1u) * MJPEG_SRC_PER_VBL) / outs;
+        uint32_t cnt = next - done;
+        done = next;
+        uint32_t sum = 0;
+        for (uint32_t j = 0; j < cnt; j++) {
+          sum += aring_pop();
+        }
+        uint8_t avg = cnt ? (uint8_t)(sum / cnt) : 0x80u;
+        const uint8_t *pair = ghost_lut[avg >> 2];
+        *buf++ = pair[0];
+        *buf++ = pair[1];
+      }
+      break;
+    }
+    case AUDIO_MODE_SILENT:
+    default:
+      memset(buf, 0, bytes);
+      break;
+  }
+  s_sample_clock += MJPEG_SRC_PER_VBL;
 }
 
 /* Read up to `bytes` from the current file position into the ring.

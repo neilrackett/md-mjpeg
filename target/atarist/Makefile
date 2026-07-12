@@ -38,7 +38,12 @@ BIN = BOOT.BIN
 # _DEBUG: 1 to enable debug, 0 to disable them
 # To disable debug, make target DEBUG_MODE=0
 DEBUG_MODE = 1
-VASMFLAGS=-Faout -quiet -x -m68000 -spaces -showopt -devpac -D_DEBUG=$(DEBUG_MODE) -DGEMDOS_DATE=$(GEMDOS_DATE_FORMATTED) -DGEMDOS_TIME=$(GEMDOS_TIME_FORMATTED) -DVERSION_MAJOR=\"$(VERSION_MAJOR)\" -DVERSION_MINOR=\"$(VERSION_MINOR)\" -DVERSION_PATCH=\"$(VERSION_PATCH)\"
+# Audio is auto-detected at runtime (STE DMA sound vs YM). FORCE_NO_DMA=1
+# forces detection to report "no DMA" so the YM/downsample fallback can
+# be tested on an STE without a plain ST. Override on the make command
+# line (build.sh passes FORCE_NO_DMA through).
+FORCE_NO_DMA ?= 0
+VASMFLAGS=-Faout -quiet -x -m68000 -spaces -showopt -devpac -D_DEBUG=$(DEBUG_MODE) -DFORCE_NO_DMA=$(FORCE_NO_DMA) -DGEMDOS_DATE=$(GEMDOS_DATE_FORMATTED) -DGEMDOS_TIME=$(GEMDOS_TIME_FORMATTED) -DVERSION_MAJOR=\"$(VERSION_MAJOR)\" -DVERSION_MINOR=\"$(VERSION_MINOR)\" -DVERSION_PATCH=\"$(VERSION_PATCH)\"
 VASM = vasm
 VLINK =  vlink
 LINKER_SCRIPT = $(SOURCES_DIR)/userfw.ld

@@ -83,6 +83,7 @@ UFW_VBL_FLAG          equ $4C6               ; word: cleared by userfw_vbl, poll
 ; bytes available (shifter only reads 200*160 = 32000 B of each
 ; screen page, allocation is 32 KB).
 UFW_VBL_VEC_SAVE      equ $00077FE0          ; longword: TOS VBL vector ($70)
+UFW_HAS_DMA           equ $00077FE4          ; byte: 1 = STE DMA sound detected
 UFW_PHYSBASE_SAVE     equ $00077FE8          ; longword: XBIOS Physbase result
 UFW_SCREEN_PAGE       equ $00077FEC          ; longword: current draw page address
 
@@ -249,6 +250,49 @@ AUDIO_BUFFER_ADDR     equ $00FA4100
 AUDIO_BUFFER_SIZE     equ 1024
 AUDIO_BUFFER_END      equ (AUDIO_BUFFER_ADDR + AUDIO_BUFFER_SIZE)
 
+; --- STE/Mega STE DMA sound (auto-detected at runtime) -----------
+; STE-class machines play 8-bit SIGNED PCM from ST RAM by DMA with no
+; CPU per sample -- a big quality win over the ~5.6 kHz 6-bit YM. We
+; run the DMA over a buffer in the UNUSED TAIL of screen page A: past
+; the 32000-byte framebuffer ($70000..$77CFF), below the userfw
+; scratch slots ($77FE0+), and never displayed (beyond the 200
+; visible lines) nor touched by the FBDRV blit -- so it needs no
+; separately-allocated ST RAM. Presence is detected at boot via the
+; _SND cookie (bit 1), stored in UFW_HAS_DMA; both the DMA and the
+; YM/Timer-B paths compile in and are chosen at runtime, and the
+; result is reported to the RP each VBL so it produces the matching
+; audio format (signed PCM for DMA, downsampled YM pairs otherwise).
+; Byte registers live at ODD addresses in the $FFFF89xx block.
+STE_DMA_CTRL          equ $FFFF8901          ; bit0 = play, bit1 = loop
+STE_DMA_START_HI      equ $FFFF8903
+STE_DMA_START_MID     equ $FFFF8905
+STE_DMA_START_LO      equ $FFFF8907
+STE_DMA_END_HI        equ $FFFF890F
+STE_DMA_END_MID       equ $FFFF8911
+STE_DMA_END_LO        equ $FFFF8913
+STE_DMA_MODE          equ $FFFF8921          ; bit7 = mono, bits1-0 = rate
+STE_DMA_MODE_VAL      equ $82                ; mono + 25033 Hz (rate = 2)
+STE_SND_BUF           equ $00077D00          ; page A tail (even, multiple of 4)
+STE_SND_BYTES         equ 500                ; ~1 PAL VBL @ 25033 Hz (mult of 4)
+STE_SND_END           equ (STE_SND_BUF + STE_SND_BYTES)
+
+; Cookie jar (_p_cookies) + _SND cookie for DMA-sound detection.
+COOKIE_JAR_PTR        equ $000005A0          ; longword: cookie jar base (0 = none)
+COOKIE_SND            equ $5F534E44          ; '_SND'; value bit 1 = DMA/PCM sound
+
+; Sound-capability report window: the m68k reads (SNDCAP_WINDOW_BASE +
+; has_dma) each VBL; the RP commemul ring decodes the low bit and
+; produces the matching audio format. Distinct from IKBD ($FB8200)
+; and VBLSYNC ($FB8400).
+SNDCAP_WINDOW_BASE    equ $FB8600
+
+; FORCE_NO_DMA=1 (build flag) forces detection to report "no DMA" so
+; the YM/downsample fallback can be exercised on an STE without a
+; plain ST. Default 0 (real detection).
+    ifnd    FORCE_NO_DMA
+FORCE_NO_DMA          equ 0
+    endc
+
 ; Number of 320-px lines the cart->ST blit covers per frame. Full ST
 ; low-res is 200; copying fewer leaves the bottom band of the
 ; destination ST page untouched (useful for a status row or to bound
@@ -347,6 +391,32 @@ userfw:
     addq.l  #2, sp
     move.l  d0, UFW_PHYSBASE_SAVE    ; saved screen base lives in RAM now
 
+    ; --- Detect STE DMA sound via the _SND cookie (bit 1) ---------
+    ; Walk the cookie jar; a null jar or a missing _SND (plain ST /
+    ; early TOS) leaves has_dma = 0 -> YM fallback. FORCE_NO_DMA=1
+    ; skips the walk entirely so the fallback can be tested on an STE.
+    ; Clobbers D0/D1/A0 -- all reloaded by the boot code that follows.
+    moveq   #0, d0                   ; assume no DMA sound
+    ifeq    FORCE_NO_DMA
+    move.l  COOKIE_JAR_PTR.w, d1     ; cookie jar base
+    beq.s   .snd_detect_done         ; null jar -> no cookies
+    movea.l d1, a0
+.snd_cookie_loop:
+    move.l  (a0), d1                 ; cookie tag
+    beq.s   .snd_detect_done         ; tag 0 = end of jar, _SND not found
+    cmp.l   #COOKIE_SND, d1
+    beq.s   .snd_found
+    addq.l  #8, a0                   ; next 8-byte entry (tag, value)
+    bra.s   .snd_cookie_loop
+.snd_found:
+    move.l  4(a0), d1               ; _SND value
+    btst    #1, d1                  ; bit 1 = DMA / PCM sound
+    beq.s   .snd_detect_done
+    moveq   #1, d0                  ; DMA sound present
+    endc
+.snd_detect_done:
+    move.b  d0, UFW_HAS_DMA
+
     ; Save TOS's VBL vector and install ours. We're in supervisor mode
     ; (entered via CA_INIT) so writing $70.w is legal.
     move.l  VBL_VECTOR.w, UFW_VBL_VEC_SAVE   ; TOS VBL vector saved in RAM
@@ -412,6 +482,11 @@ userfw:
     clr.b   MFP_IMRA.w
     clr.b   MFP_IMRB.w
 
+    ; Audio back-end chosen at runtime from UFW_HAS_DMA (detected
+    ; above). Both the YM/Timer-B and STE DMA paths are compiled in.
+    tst.b   UFW_HAS_DMA
+    bne     .boot_audio_dma          ; DMA sound present -> STE path
+
     ; --- YM2149 init: ch A + ch B as Ghostbusters dual-channel DAC
     ; Enable tones on BOTH ch A and ch B (mixer bits 0,1 = 0). Tone
     ; periods all 0 so the counters run at max -- effectively DC
@@ -470,6 +545,28 @@ userfw:
 
     bset    #0, MFP_IERA.w                ; Timer-B IRQ enable (IERA bit 0)
     bset    #0, MFP_IMRA.w                ; Timer-B IRQ unmask (IMRA bit 0)
+    bra     .boot_audio_done
+
+.boot_audio_dma:
+    ; --- STE DMA sound init: mono 25033 Hz, loop mode. Silence the
+    ; buffer, program start/end (24-bit, split hi/mid/lo), start the
+    ; loop. The DMA then free-runs; .after_copy refills the buffer each
+    ; VBL. No Timer-B, no YM writes -- the DMA needs no per-sample CPU.
+    lea     STE_SND_BUF, a0
+    move.w  #(STE_SND_BYTES/4)-1, d0
+.ste_snd_clr:
+    clr.l   (a0)+
+    dbf     d0, .ste_snd_clr
+    move.b  #STE_DMA_MODE_VAL, STE_DMA_MODE.w
+    move.b  #((STE_SND_BUF>>16)&$FF), STE_DMA_START_HI.w
+    move.b  #((STE_SND_BUF>>8)&$FF), STE_DMA_START_MID.w
+    move.b  #(STE_SND_BUF&$FF), STE_DMA_START_LO.w
+    move.b  #((STE_SND_END>>16)&$FF), STE_DMA_END_HI.w
+    move.b  #((STE_SND_END>>8)&$FF), STE_DMA_END_MID.w
+    move.b  #(STE_SND_END&$FF), STE_DMA_END_LO.w
+    move.b  #$03, STE_DMA_CTRL.w          ; play + loop
+
+.boot_audio_done:
 
     ; Interrupts back on (caller's level, typically $2300).
     move.w  (sp)+, sr
@@ -551,6 +648,30 @@ userfw:
 
 .after_copy:
 
+    ; Report sound capability to the RP every VBL: one cart-bus read at
+    ; SNDCAP_WINDOW_BASE + has_dma. The RP's commemul ring decodes the
+    ; low bit and produces the matching audio format (signed PCM for
+    ; DMA, downsampled YM pairs otherwise). A1/D1 are scratch.
+    moveq   #0, d1
+    move.b  UFW_HAS_DMA, d1
+    lea     SNDCAP_WINDOW_BASE, a1
+    tst.b   (a1, d1.w)
+
+    ; When DMA sound is active, refill its page-tail buffer from the
+    ; cart PCM (loop-mode DMA reads STE_SND_BUF continuously; one VBL
+    ; of fresh signed samples each frame). A1/A2/D1 are scratch
+    ; (clobbered by FBDRV_INLINE, not consumed by the page-flip below
+    ; which uses A5/D0). ~125 longwords from the cart, ~0.3 ms.
+    tst.b   UFW_HAS_DMA
+    beq.s   .no_dma_refill
+    lea     AUDIO_BUFFER_ADDR, a1
+    lea     STE_SND_BUF, a2
+    move.w  #(STE_SND_BYTES/4)-1, d1
+.ste_snd_copy:
+    move.l  (a1)+, (a2)+
+    dbf     d1, .ste_snd_copy
+.no_dma_refill:
+
     ; Flip the video base to the just-written page. A5 still holds
     ; UFW_SCREEN_PAGE (preserved by FBDRV_INLINE). Only the MID byte
     ; of the screen base differs between the two pages -- HIGH was
@@ -587,6 +708,11 @@ userfw:
     ;
     ; Mask interrupts before touching MFP / vectors.
     ori.w   #$0700, sr
+
+    tst.b   UFW_HAS_DMA
+    beq.s   .no_dma_stop
+    move.b  #$00, STE_DMA_CTRL.w          ; stop DMA sound before GEM returns
+.no_dma_stop:
 
     ; Recompute the save-area pointer from UFW_PHYSBASE_SAVE in
     ; case anything clobbered A5 during the run.
@@ -648,7 +774,10 @@ userfw:
 ; buffer is no longer filled; ESC detection runs through the inline
 ; IKBD poll in FBDRV_INLINE.
 userfw_vbl:
-    movea.l #AUDIO_BUFFER_ADDR, a0
+    tst.b   UFW_HAS_DMA
+    bne.s   .vbl_no_cursor               ; DMA path has no read cursor
+    movea.l #AUDIO_BUFFER_ADDR, a0        ; reset Timer-B (YM) read cursor
+.vbl_no_cursor:
     clr.w   UFW_VBL_FLAG.w
     rte
 

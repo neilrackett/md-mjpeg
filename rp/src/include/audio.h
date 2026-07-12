@@ -51,6 +51,23 @@ extern "C" {
  * Called from the main loop at ~50 Hz; must not block. */
 typedef void (*audio_fill_cb_t)(uint8_t *buf, uint32_t bytes);
 
+/* Audio back-end, chosen at runtime from the m68k's _SND detection
+ * (reported over the cart bus, decoded in fb.c). Governs the per-VBL
+ * refill size and the format the fill callback produces. Defaults to
+ * SILENT until the first report arrives. */
+typedef enum {
+  AUDIO_MODE_SILENT = 0, /* zeros -- pre-report / no audio    */
+  AUDIO_MODE_YM,         /* 224 B/VBL: 112 (vA,vB) pairs      */
+  AUDIO_MODE_DMA         /* 500 B/VBL: 500 signed PCM samples */
+} audio_mode_t;
+
+/* Set the back-end (idempotent). Called by the cart-bus capability
+ * decoder; changes the refill size the fill callback is asked for. */
+void audio_set_mode(audio_mode_t mode);
+
+/* Current back-end, for the fill callback to pick its output format. */
+audio_mode_t audio_get_mode(void);
+
 /* Initialise the cart audio buffer pointer; clear any previously
  * installed callback. Call once during boot. */
 void audio_init(void);

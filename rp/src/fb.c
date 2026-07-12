@@ -21,6 +21,7 @@
 #include "fb_chunked.h"
 #include "fb_font.h"
 #include "font8x8.h"            /* defines `font8x8` (FB_FONT instance) */
+#include "audio.h"
 #include "ikbd.h"
 #include "pico/time.h"          /* time_us_32 for the timing overlay */
 
@@ -33,6 +34,9 @@
  * m68k isn't emitting acks (e.g. before it boots). */
 #define FB_VBLSYNC_HIBYTE   0x8400u
 #define FB_VBLSYNC_HIMASK   0xFF00u
+/* Sound-capability report window ($FB8600 = YM, $FB8601 = DMA). */
+#define FB_SNDCAP_HIBYTE    0x8600u
+#define FB_SNDCAP_HIMASK    0xFF00u
 /* Safety net only: must comfortably exceed the worst-case latency from
  * "counter bumped" to "m68k VBLSYNC" (up to ~2 VBLs = 40 ms when c2p
  * overruns the slack and the m68k skips a frame). Firing early would
@@ -255,6 +259,12 @@ static void fb_rom3_dispatch(uint16_t sample) {
   ikbd_consume_rom3_sample(sample);
   if ((sample & FB_VBLSYNC_HIMASK) == FB_VBLSYNC_HIBYTE) {
     s_vbl_seen++;
+  }
+  /* Sound-capability report (userfw.s emits it each VBL at
+   * SNDCAP_WINDOW_BASE + has_dma = $FB8600/$FB8601). Low bit picks the
+   * audio back-end so the RP produces the matching format. */
+  if ((sample & FB_SNDCAP_HIMASK) == FB_SNDCAP_HIBYTE) {
+    audio_set_mode((sample & 1u) ? AUDIO_MODE_DMA : AUDIO_MODE_YM);
   }
 }
 

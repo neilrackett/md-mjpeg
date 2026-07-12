@@ -25,7 +25,10 @@ target_firmware="target_firmware.h"
 # (CI, sub-shells, build wrappers). Without it stcmd's `-it` flag aborts
 # with "the input device is not a TTY" and the build silently keeps
 # whatever BOOT.BIN was previously generated.
-STCMD_NO_TTY=1 ST_WORKING_FOLDER=$working_folder stcmd make $build_type
+# FORCE_NO_DMA (1 = force the YM/downsample fallback for testing on an
+# STE) is passed as a make command-line variable so it reaches vasm
+# regardless of how the environment forwards into the stcmd container.
+STCMD_NO_TTY=1 ST_WORKING_FOLDER=$working_folder stcmd make FORCE_NO_DMA=${FORCE_NO_DMA:-0} $build_type
 make_status=$?
 if [ "$make_status" -ne 0 ]; then
     echo "ERROR: m68k make failed (status $make_status)"

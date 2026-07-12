@@ -157,6 +157,11 @@ else()
     message(STATUS "Palette hysteresis: ON (default)")
 endif()
 
+# Audio back-end is auto-detected at runtime (STE DMA vs YM), reported
+# by the m68k over the cart bus -- no build flag. The m68k-side
+# FORCE_NO_DMA=1 (see target/atarist/Makefile) forces the YM fallback
+# for testing on an STE; the RP follows whatever the m68k reports.
+
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
 

@@ -30,15 +30,36 @@
  * main-loop cycles than necessary. */
 #define AUDIO_FRAME_PERIOD_US 20000u
 
-/* m68k Timer-B consumption per PAL VBL. Must stay in sync with the
- * Timer-B rate in target/atarist/src/userfw.s:
- *   TBDR=110 /4 prescaler -> 5,585.45 Hz -> 111.71 samples/VBL
- *   = 223.43 B/VBL @ 2 B/sample (dual-channel mode).
- * Rounded up to 224. The remaining ~800 B of CART_AUDIO_BUFFER_SIZE
- * is intentional headroom -- not consumed within a single VBL, but
- * left as a safety pad if the m68k's A0 cursor ever overruns its
- * per-VBL budget. */
-#define AUDIO_FILL_BYTES_PER_VBL 224u
+/* Audio back-end is chosen at RUNTIME from the m68k's _SND detection,
+ * reported over the cart bus (see fb.c / userfw.s). audio_set_mode()
+ * switches the per-VBL refill size, and the fill callback keys off
+ * audio_get_mode() to produce the matching format:
+ *  - AUDIO_MODE_YM: 5,585 Hz, 112 samples/VBL x 2 B (vA,vB) = 224 B.
+ *  - AUDIO_MODE_DMA: 25,033 Hz, 500 samples/VBL x 1 B (signed) = 500 B.
+ *  - AUDIO_MODE_SILENT: 500 B of zeros until the first report arrives
+ *    (zeros are silence for both the DMA and YM readers).
+ * Default is SILENT so nothing plays garbage before the m68k reports. */
+#define AUDIO_FILL_BYTES_YM  224u
+#define AUDIO_FILL_BYTES_DMA 500u
+
+static audio_mode_t s_audio_mode = AUDIO_MODE_SILENT;
+static uint32_t s_fill_bytes = AUDIO_FILL_BYTES_DMA;
+
+void audio_set_mode(audio_mode_t mode) {
+  if (mode == s_audio_mode) {
+    return;
+  }
+  s_audio_mode = mode;
+  s_fill_bytes = (mode == AUDIO_MODE_YM) ? AUDIO_FILL_BYTES_YM
+                                         : AUDIO_FILL_BYTES_DMA;
+  DPRINTF("audio_set_mode: %s (%u B/VBL)\n",
+          mode == AUDIO_MODE_DMA ? "STE DMA" : mode == AUDIO_MODE_YM
+                                                   ? "YM"
+                                                   : "silent",
+          (unsigned)s_fill_bytes);
+}
+
+audio_mode_t audio_get_mode(void) { return s_audio_mode; }
 
 static uint8_t *s_audio_buf;
 static uint32_t s_last_frame_us;
@@ -78,8 +99,7 @@ void audio_init(void) {
 
   DPRINTF("audio_init: cart buffer %u B at offset $%04X, %u B/VBL refill\n",
           (unsigned)CART_AUDIO_BUFFER_SIZE,
-          (unsigned)CART_AUDIO_BUFFER_OFFSET,
-          (unsigned)AUDIO_FILL_BYTES_PER_VBL);
+          (unsigned)CART_AUDIO_BUFFER_OFFSET, (unsigned)s_fill_bytes);
 }
 
 void audio_set_fill_callback(audio_fill_cb_t cb) {
@@ -201,5 +221,5 @@ void audio_render_frame(void) {
   }
   s_last_frame_us = now_us;
 
-  s_fill_cb(s_audio_buf, AUDIO_FILL_BYTES_PER_VBL);
+  s_fill_cb(s_audio_buf, s_fill_bytes);
 }
