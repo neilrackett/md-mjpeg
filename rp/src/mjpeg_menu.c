@@ -29,11 +29,11 @@ extern const struct FB_FONT font8x8; /* defined in fb.c */
  * hint. Names are stored truncated -- ~40 chars fit across at 8 px. */
 #define MENU_MAX_FILES 20
 #define MENU_NAME_LEN 48
-#define MENU_TOP 22   /* y of the first list row      */
-#define MENU_ROW_H 8  /* font8x8 row height           */
-#define MENU_X 16     /* list text left edge          */
-#define MENU_BAR_X 12 /* highlight bar left edge      */
-#define MENU_BAR_W 296
+#define MENU_TOP 22             /* y of the first list row      */
+#define MENU_ROW_H 8            /* font8x8 row height           */
+#define MENU_X 16               /* list text left edge          */
+#define MENU_BAR_X 0            /* highlight bar: full screen width, aligning */
+#define MENU_BAR_W FB_CHUNKED_W /* with the title/credit line edges  */
 
 static char s_names[MENU_MAX_FILES][MENU_NAME_LEN];
 static int s_count;
@@ -49,8 +49,7 @@ static void menu_scan(const char *folder) {
   FILINFO fno;
   FRESULT fr = f_findfirst(&dir, &fno, folder, "*.AVI");
   while (fr == FR_OK && fno.fname[0] != '\0' && s_count < MENU_MAX_FILES) {
-    if (fno.fname[0] != '.' &&
-        !(fno.fattrib & (AM_DIR | AM_HID | AM_SYS))) {
+    if (fno.fname[0] != '.' && !(fno.fattrib & (AM_DIR | AM_HID | AM_SYS))) {
       snprintf(s_names[s_count], MENU_NAME_LEN, "%s", fno.fname);
       s_count++;
     }
@@ -148,7 +147,7 @@ void mjpeg_menu_render(int selected) {
       int y = MENU_TOP + i * MENU_ROW_H;
       if (i == selected) {
         fb_fill_rect(MENU_BAR_X, y, MENU_BAR_W, MENU_ROW_H, 15); /* white bar */
-        font_set_color(0);                                       /* black text */
+        font_set_color(0); /* black text */
       } else {
         font_set_color(15); /* white text */
       }
@@ -158,9 +157,9 @@ void mjpeg_menu_render(int selected) {
   }
 
   font_align(FONT_ALIGN_CENTER);
-  font_set_color(15);
+  font_set_color(2); /* medium-dark grey, matching the credit line */
   font_move(FB_CHUNKED_W / 2, 190);
-  font_print("RETURN PLAY   ESC QUIT");
+  font_print("Return/PLAY   Esc/QUIT");
 
   font_align(FONT_ALIGN_LEFT);
   fb_publish();

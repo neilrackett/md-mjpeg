@@ -24,9 +24,9 @@ behind, frames are skipped so audio never stalls.
 Built from **md-framebuffer-template** (the framework does the heavy
 lifting): dual page-flipped framebuffer on the ST side, real 50 Hz VBL lock,
 chunky→planar conversion split across both cores, ~6 kHz YM audio, IKBD
-keyboard decoding. The template's demo suite was stripped
-(`examples/hello_text/apply.sh`); the pristine pre-strip tree is in `rp.bak/`
-(gitignored) and the demos remain the reference for RP2040 optimization
+keyboard decoding. The template's demo suite was stripped out; the
+pristine pre-strip tree is in `rp.bak/` (gitignored) and the demos remain
+the reference for RP2040 optimization
 tricks (per-file `#pragma GCC optimize("O3")`, `__not_in_flash_func`,
 fixed-point LUTs, SIO interpolator, `fb_core1_dispatch` dual-core splits).
 
@@ -311,6 +311,15 @@ PIO+DMA read engine), `commemul` (ROM3 capture ring; drained via
 `gconfig`/`aconfig` (settings; gconfig defaults mirror Booster — don't trim
 the WiFi params), `select`, `reset`, `fb_*`, `palette`, `audio`, `ikbd`,
 `font8x8`.
+
+**Platform-level reference** (dev-env setup, VS Code, the full generic
+RP↔m68k command framework `tprotocol.h`/`chandler`, and the `network.c`/
+`httpc`/`download.c` WiFi stack) lives upstream in **`md-microfirmware-template`**
+(and, for the download bits, in the deferred-download memory note). MD/MJPEG
+uses none of that command framework — it decodes ROM3 reads directly in
+`fb_rom3_dispatch` (a magic-word sentinel + fixed windows, no header/checksum
+protocol), and links no cyw43/lwIP. This repo's own `programming.md` (a copy
+of the template's platform guide) was removed as an upstream duplicate.
 
 ## Troubleshooting
 

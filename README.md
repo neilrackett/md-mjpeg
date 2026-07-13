@@ -8,6 +8,8 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 MD/MJPEG turns your SidecarTridge Multi-device into a video player for your Atari ST: drop an `.AVI` file onto the SD card and it plays full-screen, full-motion video with sound on a stock ST — no hard drive, no accelerator, no extra hardware.
 
+Why? Because why watch videos at 4K resolution in 16.7 million colours when you can watch them at 0.3K in 16!
+
 Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut, blue-noise dither and a saturation boost, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound is 8-bit 25 kHz DMA audio on an STE, or the YM2149 (~5.6 kHz) on a plain ST — the firmware detects which machine it's on and picks the best it can do. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
 
 When it starts, the app lists the `.AVI` files in the `/mjpeg` folder of the SD card. Use **Up/Down** to choose one and **Return** to play it. During playback, **Left/Right** skip back/forward 10 seconds, **Space** pauses and resumes, and **ESC** returns to the list (a time readout pops up briefly when you seek or pause). When a video reaches the end it returns to the list too. From the list, **ESC** quits back to GEM.
@@ -58,8 +60,9 @@ By default the audio is encoded at 5.6 kHz for the YM2149. If you have an STE, p
 
 A few ideas we've had (no promises we'll do them all):
 
-- Squeezing out the last few ms per frame for rock-solid 25 fps
-- Better audio quality modes
+- Auto-downloading an example video when the SD card is empty?
+- Palette tricks to go beyond 16 colours?
+- Overscan to go full screen?
 
 Think you can help? Got an idea of your own? We'd love to hear from you, so why not let me know on [X](https://x.com/neilrackett) or submit a PR.
 
