@@ -1,8 +1,8 @@
 {
   "uuid": "<APP_UUID>",
   "name": "MD/MJPEG",
-  "description": "Why watch videos at 4K resolution in 16.7 million colours when you can watch them at 0.3K in 16! Stream MJPEG video with sound from your SidecarT's SD card to your Atari ST",
-  "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
+  "description": "Why watch videos at 4K resolution in 16.7 million colours when you can watch them at 0.3K in 16! Stream MJPEG video with sound from your SidecarT's SD card to your Atari ST. For more information, visit <a href=\"https://neilrackett.com/atarist\">neilrackett.com</a>.",
+  "image": "https://downloads.neilrackett.com/md-mjpeg/image.webp",
   "tags": [
     "Video"
   ],
@@ -12,7 +12,7 @@
     "MegaST",
     "MegaSTE"
   ],
-  "binary": "https://atarist.neilrackett.com/<APP_UUID>-<APP_VERSION>.uf2",
+  "binary": "https://downloads.neilrackett.com/md-mjpeg/<APP_UUID>.uf2",
   "md5": "<BINARY_MD5_HASH>",
   "version": "<APP_VERSION>"
 }
