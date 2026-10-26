@@ -102,6 +102,21 @@ void __not_in_flash_func(fb_transpose)(void);
  * and after the m68k has finished blitting the previous frame. */
 void __not_in_flash_func(fb_planar_publish)(uint16_t *planar);
 
+/* ST high res (a mono monitor): the chunked buffer as a 640x400 one-bit
+ * picture in the same scratch, in place of fb_transpose(). Each pixel is
+ * doubled both ways and its pen given a level by `levels` (16 entries,
+ * 0..16: 0 is black ink, 16 white paper, and between that fraction of
+ * the pixels white), dithered at the output resolution against the
+ * 32x32 blue noise. It is the same 32000 bytes -- 400 rows of 40 words,
+ * the leftmost pixel in bit 15, a set bit black -- so fb_planar_publish()
+ * copies it out unchanged. Dual-core, like fb_transpose(). */
+void fb_transpose_mono(const uint8_t levels[16]);
+
+/* fb_transpose_mono's worker (fb_mono.c): chunked rows [y0, y1) into
+ * output rows 2*y0 .. 2*y1-1 of `scratch`. */
+void fb_mono_rows(uint16_t *scratch, unsigned y0, unsigned y1,
+                  const uint8_t levels[16]);
+
 #ifdef __cplusplus
 }
 #endif

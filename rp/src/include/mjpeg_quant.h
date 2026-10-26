@@ -32,6 +32,8 @@
 #ifndef MJPEG_QUANT_H_INCLUDED
 #define MJPEG_QUANT_H_INCLUDED
 
+#include <stdbool.h>
+
 #include "JPEGDEC.h"
 
 #ifdef __cplusplus
@@ -47,10 +49,24 @@ void mq_init(void);
  * into fb_chunked_buffer and calls mjpeg_service(). */
 int mq_draw(JPEGDRAW *pDraw);
 
-/* Median-cut the frame histogram into the next frame's palette:
- * publishes it (sorted darkest-first, so palette index 0 -- the ST
- * border colour -- stays dark), rebuilds the pixel map, clears the
- * histogram. Call once after each successful decode. */
+/* ST high res: the JPEGDEC draw callback for a luma-only decode
+ * (EIGHT_BIT_GRAYSCALE). Writes each pixel as one of 16 grey pens, 0
+ * black to 15 white in linear light, and calls mjpeg_service(). No
+ * histogram or palette: nothing reads the palette in mono. */
+int mq_draw_mono(JPEGDRAW *pDraw);
+
+/* fb_set_mono_levels() table for mq_draw_mono's pens: an even ramp. */
+extern const uint8_t mq_mono_levels[16];
+
+/* While the menu is drawn over the video: hold palette entry 15 at
+ * white (entry 0 is always black), so its box and ink stay readable
+ * whatever the frame. Republishes at once; mq_init() clears it. */
+void mq_set_menu_pens(bool on);
+
+/* Median-cut the frame histogram into the next frame's palette: fifteen
+ * colours plus black, sorted darkest-first so palette index 0 -- the ST
+ * border colour -- is always black. Publishes it, rebuilds the pixel map,
+ * clears the histogram. Call once after each successful decode. */
 void mq_frame_done(void);
 
 #ifdef __cplusplus

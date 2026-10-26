@@ -9,7 +9,8 @@
  *              folder and draws it as a MiSTer-style OSD box, the same
  *              layout as MD/Lynx's: a strip down the left edge carries
  *              the title, the settings rows sit on top and the videos
- *              below. See mjpeg_menu.h; the MENU <-> PLAYING state
+ *              below. The same box is drawn on its own or over a playing
+ *              video. See mjpeg_menu.h; the MENU <-> PLAYING state
  *              machine lives in emul.c.
  */
 
@@ -70,6 +71,15 @@ static const uint16_t MenuPalette[PALETTE_ENTRIES] = {
     PALETTE_RGB(0, 0, 0), PALETTE_RGB(0, 0, 0),
     PALETTE_RGB(0, 0, 0), PALETTE_RGB(0, 0, 0),
     PALETTE_RGB(0, 0, 0),
+};
+
+/* ST high res (fb_set_mono_levels): black and white alone would lose the
+ * box against the screen around it, so the screen takes a third tone, a
+ * 50% grey dither, and the box is black with white ink. */
+static const uint8_t MenuMonoLevels[PALETTE_ENTRIES] = {
+    [PEN_BG] = 8,
+    [PEN_INK] = 16,
+    [PEN_PANEL] = 0,
 };
 
 static char s_names[MENU_MAX_FILES][MENU_NAME_LEN];
@@ -202,6 +212,20 @@ static const char *settings_value(int item) {
 #define MENU_TEXT_COLS ((MENU_TEXT_R - MENU_TEXT_X) / CELL_W)
 #define MENU_ROW_Y(i) (MENU_Y + MENU_PAD + (i) * CELL_H)
 
+/* Two pens, like MiSTer's OSD: everything is ink on the fill, and the
+ * strip and the selection bar are the fill on ink. */
+struct menu_style {
+  uint8_t bg;  /* box fill, and the ink on the strip and selection bar */
+  uint8_t ink; /* text, the strip and the selection bar               */
+};
+
+/* On its own the menu has its own palette's navy and white. Over a
+ * video it has the frame's pens 0 and 15: the quantizer's 0 is always
+ * black and it holds 15 at white while the menu is up (mq_set_menu_pens),
+ * and mono's grey ramp makes them black and white anyway. */
+static const struct menu_style MenuOwn = {PEN_PANEL, PEN_INK};
+static const struct menu_style MenuOverVideo = {0, PALETTE_ENTRIES - 1};
+
 /* Text at a pixel position; `x` is the left edge, the centre or the
  * right edge according to `align`. */
 static void text_px(int x, int y, uint8_t pen, const char *s,
@@ -234,8 +258,8 @@ static void text_up(int x, int y_bottom, uint8_t pen, const char *s) {
 }
 
 /* Centre `s` across the list. */
-static void menu_centred(int row, const char *s) {
-  text_px(MENU_LIST_X + MENU_LIST_W / 2, MENU_ROW_Y(row), PEN_INK, s,
+static void menu_centred(const struct menu_style *st, int row, const char *s) {
+  text_px(MENU_LIST_X + MENU_LIST_W / 2, MENU_ROW_Y(row), st->ink, s,
           FONT_ALIGN_CENTER);
 }
 
@@ -250,19 +274,20 @@ static void draw_arrow(int cx, int y, bool down, uint8_t pen) {
 
 /* The box and its strip, with an arrow on the strip wherever the list
  * runs on above or below what is shown. */
-static void draw_box(bool more_above, bool more_below) {
+static void draw_box(const struct menu_style *st, bool more_above,
+                     bool more_below) {
   static const char title[] = "MD/MJPEG";
   const int len = (int)(sizeof(title) - 1) * CELL_W;
 
-  fb_fill_rect(MENU_X, MENU_Y, MENU_STRIP_W, MENU_H, PEN_INK);
-  fb_fill_rect(MENU_LIST_X, MENU_Y, MENU_LIST_W, MENU_H, PEN_PANEL);
+  fb_fill_rect(MENU_X, MENU_Y, MENU_STRIP_W, MENU_H, st->ink);
+  fb_fill_rect(MENU_LIST_X, MENU_Y, MENU_LIST_W, MENU_H, st->bg);
   text_up(MENU_X + (MENU_STRIP_W - CELL_H) / 2,
-          MENU_Y + (MENU_H + len) / 2 - 1, PEN_PANEL, title);
+          MENU_Y + (MENU_H + len) / 2 - 1, st->bg, title);
 
   const int cx = MENU_X + MENU_STRIP_W / 2;
-  if (more_above) draw_arrow(cx, MENU_Y + MENU_PAD, false, PEN_PANEL);
+  if (more_above) draw_arrow(cx, MENU_Y + MENU_PAD, false, st->bg);
   if (more_below) {
-    draw_arrow(cx, MENU_Y + MENU_H - MENU_PAD - 4, true, PEN_PANEL);
+    draw_arrow(cx, MENU_Y + MENU_H - MENU_PAD - 4, true, st->bg);
   }
 }
 
@@ -274,13 +299,13 @@ static void display_name(const char *name, char *out, size_t cap) {
   if (strlen(out) > (size_t)MENU_TEXT_COLS) out[MENU_TEXT_COLS] = '\0';
 }
 
-static void draw_menu(void) {
+static void draw_menu(const struct menu_style *st) {
   const int total = menu_rows_total();
   int first = sel_to_row(s_selected) - MENU_ROWS / 2;
   if (first > total - MENU_ROWS) first = total - MENU_ROWS;
   if (first < 0) first = 0;
 
-  draw_box(first > 0, first + MENU_ROWS < total);
+  draw_box(st, first > 0, first + MENU_ROWS < total);
 
   char line[TEXT_COLS + 1];
   for (int i = 0; i < MENU_ROWS; i++) {
@@ -292,10 +317,10 @@ static void draw_menu(void) {
 
     /* The selected row is inverted right across the list, hard against
      * the strip, as MiSTer draws it. */
-    uint8_t pen = PEN_INK;
+    uint8_t pen = st->ink;
     if (item == s_selected) {
-      fb_fill_rect(MENU_LIST_X, y, MENU_LIST_W, CELL_H, PEN_INK);
-      pen = PEN_PANEL;
+      fb_fill_rect(MENU_LIST_X, y, MENU_LIST_W, CELL_H, st->ink);
+      pen = st->bg;
     }
 
     if (item >= 0) {
@@ -309,38 +334,38 @@ static void draw_menu(void) {
   }
 
   if (s_count == 0) {
-    menu_centred(UI_ITEM_COUNT + 1, "NO .AVI FILES");
-    menu_centred(UI_ITEM_COUNT + 2, s_home);
+    menu_centred(st, UI_ITEM_COUNT + 1, "NO .AVI FILES");
+    menu_centred(st, UI_ITEM_COUNT + 2, s_home);
   }
 }
 
 /* Kept inside MENU_TEXT_COLS so it fits the same box as the menu. */
-static void draw_about(void) {
-  draw_box(false, false);
+static void draw_about(const struct menu_style *st) {
+  draw_box(st, false, false);
 
   int y = 0;
-  menu_centred(y++, "MD/MJPEG " RELEASE_VERSION);
+  menu_centred(st, y++, "MD/MJPEG " RELEASE_VERSION);
   y++;
-  menu_centred(y++, "MJPEG VIDEO PLAYER");
-  menu_centred(y++, "neilrackett.com");
+  menu_centred(st, y++, "MJPEG VIDEO PLAYER");
+  menu_centred(st, y++, "neilrackett.com");
   y += 2;
-  menu_centred(y++, "JPEG: JPEGDEC, APACHE-2.0");
-  menu_centred(y++, "(C) LARRY BANK");
+  menu_centred(st, y++, "JPEG: JPEGDEC, APACHE-2.0");
+  menu_centred(st, y++, "(C) LARRY BANK");
   y++;
 
   switch (audio_get_mode()) {
     case AUDIO_MODE_DMA:
-      menu_centred(y++, "SOUND: STE DMA");
+      menu_centred(st, y++, "SOUND: STE DMA");
       break;
     case AUDIO_MODE_YM:
-      menu_centred(y++, "SOUND: YM2149");
+      menu_centred(st, y++, "SOUND: YM2149");
       break;
     default:
-      menu_centred(y++, "SOUND: DETECTING");
+      menu_centred(st, y++, "SOUND: DETECTING");
       break;
   }
 
-  menu_centred(MENU_ROWS - 1, "PRESS ANY KEY");
+  menu_centred(st, MENU_ROWS - 1, "PRESS ANY KEY");
 }
 
 /* ================================== API ================================== */
@@ -376,7 +401,7 @@ int mjpeg_menu_key(uint8_t scancode) {
   /* The About page is modal: any key dismisses it and is swallowed. */
   if (s_about) {
     s_about = false;
-    return -1;
+    return MJPEG_MENU_NONE;
   }
   switch (scancode) {
     case SC_UP:
@@ -396,12 +421,11 @@ int mjpeg_menu_key(uint8_t scancode) {
       }
       break;
     case SC_ESC:
-      ikbd_request_boot_gem(); /* nothing to go back to: quit to GEM */
-      break;
+      return MJPEG_MENU_BACK; /* the caller's: back to the video, or GEM */
     default:
       break;
   }
-  return -1;
+  return MJPEG_MENU_NONE;
 }
 
 void mjpeg_menu_render(void) {
@@ -410,10 +434,20 @@ void mjpeg_menu_render(void) {
   palette_set(MenuPalette);
   fb_chunked_clear(PEN_BG);
   if (s_about) {
-    draw_about();
+    draw_about(&MenuOwn);
   } else {
-    draw_menu();
+    draw_menu(&MenuOwn);
   }
   font_align(FONT_ALIGN_LEFT);
+  fb_set_mono_levels(MenuMonoLevels);
   fb_publish();
+}
+
+void mjpeg_menu_draw_over(void) {
+  if (s_about) {
+    draw_about(&MenuOverVideo);
+  } else {
+    draw_menu(&MenuOverVideo);
+  }
+  font_align(FONT_ALIGN_LEFT);
 }

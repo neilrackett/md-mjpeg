@@ -13,11 +13,14 @@ boot-related.
 RP2040 in the Atari ST cartridge slot). It streams a standard AVI (MJPEG
 320×200 @ 25 fps + mono u8 PCM @ 5600 Hz for YM, or 25033 Hz for STE DMA
 sound) from the SidecarT's SD card, decodes JPEG frames on the RP2040,
-quantizes each frame to its own 16-colour ST palette (median cut over an
-exact RGB333 histogram + blue-noise ordered dither + a saturation/contrast
+quantizes each frame to its own 16-colour ST palette (median cut to 15
+colours over an exact RGB333 histogram, plus black at index 0 so the ST
+border stays black, + blue-noise ordered dither + a saturation/contrast
 boost), and blits it to the ST screen over the cartridge bus at up to 25 fps.
 Audio is universal: the firmware auto-detects STE DMA sound (25 kHz 8-bit)
-and falls back to YM2149 (~5.6 kHz) on a plain ST. A/V sync is audio-master:
+and falls back to YM2149 (~5.6 kHz) on a plain ST. On a mono monitor (ST
+high res) it plays in black and white instead: each frame decoded luma-only
+and dithered to 640×400 (see "ST high res" below). A/V sync is audio-master:
 the fill callback's sample clock paces video; when decoding falls ≥2 frames
 behind, frames are skipped so audio never stalls.
 
@@ -36,7 +39,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
 | `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
-| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play |
+| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish) in the frame's pens 0 and 15: pen 0 is always black, and `mq_set_menu_pens()` holds 15 at white while it is up (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop, stall detector, cart-corruption canary |
 | `tools/video_to_avi.sh` | ffmpeg wrapper producing the AVI format contract |
@@ -135,8 +138,9 @@ included, for the host as `build/md-mjpeg.mdfw` and runs it in a patched
 Hatari, with the real m68k cartridge (`target_firmware.h`, so whatever the
 last `make build` made) on the cartridge port and `emu/sd` as the microSD
 card (videos in `emu/sd/mjpeg`, gitignored; symlinks into `test-videos/`
-work). `make emu` runs it in a window (`MACHINE=st` for the YM path). For a
-check without one:
+work). `make emu` runs it in a window (`MACHINE=st` for the YM path,
+`MONO=1` for a mono monitor: Hatari's `--monitor mono`). For a check without
+one:
 
 ```bash
 emu/emumd/tools/mdfw run --headless --frames 1200 --no-user-config \
@@ -302,6 +306,40 @@ emulated via PIO + DMA.
    ESC press+release within 200 ms writes `CART_CMD_BOOT_GEM` to the cart
    sentinel; the m68k polls it each frame and exits cleanly to GEM.
 
+### ST high res (a mono monitor)
+
+Ported from md-doom's mono support. `main.s` lets high res through, and
+`userfw.s` reads the shifter at boot (`UFW_MONO`): colour 0 is set once to
+white paper (a set bit is black ink) and the palette copy is skipped. The
+cart FB is the same 32,000 bytes in the same chunk-reversed layout — 400
+rows of 80 bytes — and the same copy, but mono VBLs are 71.47 Hz (14 ms)
+and the copy takes ~17.6 ms, so **a mono frame is two VBLs**: the first
+copies `FBDRV_ITERS_A` chunks, sets `UFW_HALF`, skips the flip and acks at
+`$FB8401`; the next copies the rest, flips and acks at `$FB8400` as usual.
+Only `$FB8400` itself is a frame ack to `fb.c` (half the FB is still unread
+after `$FB8401`). The display is reported every VBL at `$FB9000 + mono` →
+`fb_st_mono()` and `audio_set_mono()`. Display rate is up to 35.7 fps, so
+25 fps video is unaffected.
+
+RP side: `fb_publish()` calls `fb_transpose_mono(levels)` instead of the
+c2p — `fb_mono.c` (shared by the hardware and EmuMD builds) doubles each
+pixel and dithers it at 640×400 against the same 32×32 blue noise, a pen's
+level 0..16 (0 ink, 16 paper) coming from a 16-entry table set with
+`fb_set_mono_levels()`. With none set, pens are black or white by their
+palette brightness (the boot splash). The menu sets its own (`MenuMonoLevels`:
+the screen a 50% grey dither, the box black, ink white — black and white
+alone lose the box against the screen); playback sets `mq_mono_levels`, a
+grey ramp. In mono `decode_frame()` runs JPEGDEC luma-only
+(`EIGHT_BIT_GRAYSCALE`, which skips the chroma IDCT and colour conversion)
+into `mq_draw_mono`, which writes 16 linear-light grey pens (Y² for the
+gamma: a mono monitor mixes light) and skips the quantizer. The time overlay
+is unchanged (pen 0 box, pen 15 text = black and white). Audio: refills
+every 14 ms, 350 DMA bytes (`userfw.s` copies 88 longwords and sets END
+from `UFW_SND_LEN`) or 79 YM pairs (Timer-B takes ~78.2 a VBL), and the
+video clock advances 350 source samples a refill (`MJPEG_SRC_PER_VBL_MONO`).
+**Untested on an SM124**: EmuMD plays it in Hatari (`make emu MONO=1`), and
+the timing claims are md-doom's arithmetic and Hatari, not hardware.
+
 ### Audio pipeline
 
 RP fills a 1 KB cart buffer (`$FA4100`) with (vA, vB) YM volume pairs each
@@ -321,7 +359,8 @@ the DMA frame counter so the m68k write never crosses the read pointer. The
 path is auto-detected at boot (`_SND` cookie, reported to the RP each VBL via
 `fb_rom3_dispatch` → `audio_set_mode`); on a plain ST the same 25 kHz stream
 is box-averaged down for the YM callback. Full detail in the DMA-sound memory
-note; both paths consume 500 source samples/VBL so A/V pacing is identical.
+note; both paths consume 500 source samples/VBL so A/V pacing is identical
+(350 at mono's 71 Hz; see "ST high res" above).
 
 ### Shared 64 KB cartridge region (`$FA0000` ↔ RP `0x20030000`)
 

@@ -27,8 +27,10 @@
 
 /* Per-VBL fill cadence. Refill every ~20 ms (one PAL VBL) so the
  * RP keeps pace with the m68k's Timer-B reads without burning more
- * main-loop cycles than necessary. */
+ * main-loop cycles than necessary. In ST high res a VBL is 71.47 Hz,
+ * so ~14 ms. */
 #define AUDIO_FRAME_PERIOD_US 20000u
+#define AUDIO_FRAME_PERIOD_US_MONO 14000u
 
 /* Audio back-end is chosen at RUNTIME from the m68k's _SND detection,
  * reported over the cart bus (see fb.c / userfw.s). audio_set_mode()
@@ -38,24 +40,46 @@
  *  - AUDIO_MODE_DMA: 25,033 Hz, 500 samples/VBL x 1 B (signed) = 500 B.
  *  - AUDIO_MODE_SILENT: 500 B of zeros until the first report arrives
  *    (zeros are silence for both the DMA and YM readers).
- * Default is SILENT so nothing plays garbage before the m68k reports. */
-#define AUDIO_FILL_BYTES_YM  224u
-#define AUDIO_FILL_BYTES_DMA 500u
+ * Default is SILENT so nothing plays garbage before the m68k reports.
+ * In ST high res (audio_set_mono) a VBL is 71.47 Hz: 79 YM pairs (one
+ * more than Timer-B's ~78.2, so a VBL that takes 79 never replays a
+ * stale pair) and 350 DMA bytes, which userfw.s copies to match. */
+#define AUDIO_FILL_BYTES_YM       224u
+#define AUDIO_FILL_BYTES_DMA      500u
+#define AUDIO_FILL_BYTES_YM_MONO  158u
+#define AUDIO_FILL_BYTES_DMA_MONO 350u
 
 static audio_mode_t s_audio_mode = AUDIO_MODE_SILENT;
 static uint32_t s_fill_bytes = AUDIO_FILL_BYTES_DMA;
+static bool s_st_mono;
+
+static uint32_t fill_bytes_for(audio_mode_t mode) {
+  if (mode == AUDIO_MODE_YM) {
+    return s_st_mono ? AUDIO_FILL_BYTES_YM_MONO : AUDIO_FILL_BYTES_YM;
+  }
+  return s_st_mono ? AUDIO_FILL_BYTES_DMA_MONO : AUDIO_FILL_BYTES_DMA;
+}
 
 void audio_set_mode(audio_mode_t mode) {
   if (mode == s_audio_mode) {
     return;
   }
   s_audio_mode = mode;
-  s_fill_bytes = (mode == AUDIO_MODE_YM) ? AUDIO_FILL_BYTES_YM
-                                         : AUDIO_FILL_BYTES_DMA;
+  s_fill_bytes = fill_bytes_for(mode);
   DPRINTF("audio_set_mode: %s (%u B/VBL)\n",
           mode == AUDIO_MODE_DMA ? "STE DMA" : mode == AUDIO_MODE_YM
                                                    ? "YM"
                                                    : "silent",
+          (unsigned)s_fill_bytes);
+}
+
+void audio_set_mono(bool mono) {
+  if (mono == s_st_mono) {
+    return;
+  }
+  s_st_mono = mono;
+  s_fill_bytes = fill_bytes_for(s_audio_mode);
+  DPRINTF("audio_set_mono: %s VBLs (%u B/VBL)\n", mono ? "71 Hz" : "50 Hz",
           (unsigned)s_fill_bytes);
 }
 
@@ -215,8 +239,9 @@ void audio_render_frame(void) {
   }
 
   uint32_t now_us = time_us_32();
-  if (s_last_frame_us != 0 &&
-      (now_us - s_last_frame_us) < AUDIO_FRAME_PERIOD_US) {
+  const uint32_t period_us =
+      s_st_mono ? AUDIO_FRAME_PERIOD_US_MONO : AUDIO_FRAME_PERIOD_US;
+  if (s_last_frame_us != 0 && (now_us - s_last_frame_us) < period_us) {
     return;
   }
   s_last_frame_us = now_us;

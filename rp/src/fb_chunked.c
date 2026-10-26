@@ -122,6 +122,20 @@ void __not_in_flash_func(fb_transpose)(void) {
   fb_core1_wait();
 }
 
+/* Mono bottom-half job: arg is the level table. */
+static void fb_mono_bottom_job(void *arg) {
+  fb_mono_rows(fb_planar_scratch, FB_CHUNKED_H / 2u, FB_CHUNKED_H,
+               (const uint8_t *)arg);
+}
+
+void fb_transpose_mono(const uint8_t levels[16]) {
+  /* Same split as fb_transpose: Core 1 the bottom 100 rows (200 output
+   * rows), Core 0 the top. */
+  fb_core1_dispatch(fb_mono_bottom_job, (void *)levels);
+  fb_mono_rows(fb_planar_scratch, 0, FB_CHUNKED_H / 2u, levels);
+  fb_core1_wait();
+}
+
 /* Thumb asm (fb_chunked_asm.S): the chunk-reversed copy via ldmia/stmia.
  * Replaces a per-chunk memcpy() loop -- GCC at -O3 can't prove the
  * uint8_t* pointers are word-aligned and emitted a `bl memcpy` per chunk

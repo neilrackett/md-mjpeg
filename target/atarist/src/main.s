@@ -263,12 +263,9 @@ start_rom_code:
 ; Enable bconin to return shift key status
 	or.b #%1000, _conterm.w
 
-; Get the resolution of the screen. High-res (640x400 mono) is not
-; supported by the framebuffer template; bail to GEM with a message
-; mirroring md-sprites-demo's lowres_only branch.
-	get_rez
-	cmp.w #2, d0
-	beq .highres_unsupported
+; Low res and high res (640x400 on a mono monitor) both run: userfw reads
+; the shifter at boot and the RP draws whichever picture it reports. (At
+; this point in the boot a colour monitor is always in low res.)
 
 ; Story 1.2: the old mono boot-UI loop (.print_loop_low, which read the
 ; first 8 KB of the cartridge framebuffer and expanded it 1bpp -> 4bpp
@@ -280,16 +277,6 @@ start_rom_code:
 ; STE-class machines, an inline blitter copy) which copies the cart FB
 ; to ST screen verbatim with the correct 4bpp planar interpretation.
 	jmp USERFW
-
-.highres_unsupported:
-	print .highres_unsupported_txt
-	bra boot_gem
-
-.highres_unsupported_txt:
-	dc.b "High resolution (640x400) not supported.",$d,$a
-	dc.b "Switch to low or medium res and reboot.",$d,$a
-	dc.b 0
-	even
 
 .reset:
     move.l #PRE_RESET_WAIT, d6

@@ -35,6 +35,7 @@
 #ifndef AUDIO_H_INCLUDED
 #define AUDIO_H_INCLUDED
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -57,13 +58,17 @@ typedef void (*audio_fill_cb_t)(uint8_t *buf, uint32_t bytes);
  * SILENT until the first report arrives. */
 typedef enum {
   AUDIO_MODE_SILENT = 0, /* zeros -- pre-report / no audio    */
-  AUDIO_MODE_YM,         /* 224 B/VBL: 112 (vA,vB) pairs      */
-  AUDIO_MODE_DMA         /* 500 B/VBL: 500 signed PCM samples */
+  AUDIO_MODE_YM,         /* 224 B/VBL: 112 (vA,vB) pairs (158 B mono) */
+  AUDIO_MODE_DMA         /* 500 B/VBL of signed PCM (350 B mono)       */
 } audio_mode_t;
 
 /* Set the back-end (idempotent). Called by the cart-bus capability
  * decoder; changes the refill size the fill callback is asked for. */
 void audio_set_mode(audio_mode_t mode);
+
+/* ST high res (idempotent): VBLs are 71.47 Hz there, so the refill comes
+ * every ~14 ms and is smaller. Called by fb.c's display-report decoder. */
+void audio_set_mono(bool mono);
 
 /* Current back-end, for the fill callback to pick its output format. */
 audio_mode_t audio_get_mode(void);

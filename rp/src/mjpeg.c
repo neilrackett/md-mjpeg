@@ -35,6 +35,7 @@
 #include "fb_font.h"
 #include "ff.h"
 #include "ikbd.h"
+#include "mjpeg_menu.h"
 #include "mjpeg_quant.h"
 #include "pico/time.h"
 
@@ -125,6 +126,7 @@ static uint32_t s_frame_index; /* next frame to show, since rewind */
 static volatile uint32_t s_sample_clock; /* advanced by the fill cb */
 
 static bool s_paused;
+static bool s_menu; /* the menu is drawn over the video */
 static uint32_t s_overlay_until;         /* show overlay until this us */
 static uint32_t s_frame_offsets[SEEK_RING]; /* frame index -> file offset */
 
@@ -151,8 +153,10 @@ static inline uint32_t aring_level(void) { return aring_head - aring_tail; }
 /* Source PCM samples consumed per VBL = the 25 kHz source rate / 50 Hz
  * VBL. Both back-ends consume this many source samples (DMA 1:1, YM
  * downsampled), so video pacing (s_sample_clock) is identical either
- * way and A/V stays locked regardless of which path is active. */
+ * way and A/V stays locked regardless of which path is active. In ST
+ * high res a VBL is 71.47 Hz, so 350 (audio.c's DMA refill matches). */
 #define MJPEG_SRC_PER_VBL 500u
+#define MJPEG_SRC_PER_VBL_MONO 350u
 
 /* Pop one unsigned source PCM sample; 0x80 (silence) on underrun. */
 static inline uint8_t aring_pop(void) {
@@ -170,7 +174,7 @@ static inline uint8_t aring_pop(void) {
  * before the first audio and across underruns):
  *  - DMA: signed-PCM passthrough. AVI stores unsigned (silence 0x80),
  *    the DMA wants signed (silence 0x00) -> flip the top bit.
- *  - YM: box-average MJPEG_SRC_PER_VBL source samples down to bytes/2
+ *  - YM: box-average one VBL of source samples down to bytes/2
  *    outputs (~4.46:1 for a 25 kHz source on a plain ST), each mapped
  *    through the Ghostbusters (vA,vB) LUT.
  *  - SILENT (pre-report): zeros. */
@@ -182,6 +186,7 @@ static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
     memset(buf, 0, bytes);
     return;
   }
+  const uint32_t src = fb_st_mono() ? MJPEG_SRC_PER_VBL_MONO : MJPEG_SRC_PER_VBL;
   switch (audio_get_mode()) {
     case AUDIO_MODE_DMA:
       for (uint32_t i = 0; i < bytes; i++) {
@@ -192,7 +197,7 @@ static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
       uint32_t outs = bytes / 2u;
       uint32_t done = 0;
       for (uint32_t i = 0; i < outs; i++) {
-        uint32_t next = ((i + 1u) * MJPEG_SRC_PER_VBL) / outs;
+        uint32_t next = ((i + 1u) * src) / outs;
         uint32_t cnt = next - done;
         done = next;
         uint32_t sum = 0;
@@ -211,7 +216,7 @@ static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
       memset(buf, 0, bytes);
       break;
   }
-  s_sample_clock += MJPEG_SRC_PER_VBL;
+  s_sample_clock += src;
 }
 
 /* Read up to `bytes` from the current file position into the ring.
@@ -385,8 +390,8 @@ static void fmt_time(uint32_t frame, char *out) {
 }
 
 /* Draw "cur / total" bottom-left over the current frame. Uses the
- * quantized palette's luminance extremes -- index 0 (darkest) for the
- * box, 15 (lightest) for the text -- so it reads on any frame. */
+ * quantized palette's luminance extremes -- index 0 (always black) for
+ * the box, 15 (lightest) for the text -- so it reads on any frame. */
 static void draw_overlay(void) {
   char cur[12], line[28];
   fmt_time(s_frame_index, cur);
@@ -409,9 +414,12 @@ static void draw_overlay(void) {
 static void decode_frame(uint32_t data, uint32_t size) {
   uint32_t t0 = time_us_32();
   memset(&s_jpg, 0, sizeof(s_jpg));
+  /* ST high res: luma only, which skips the chroma IDCT and colour
+   * conversion, into grey pens instead of the colour quantizer. */
+  const bool mono = fb_st_mono();
   s_jpg.pfnRead = jpg_read;
   s_jpg.pfnSeek = jpg_seek;
-  s_jpg.pfnDraw = mq_draw;
+  s_jpg.pfnDraw = mono ? mq_draw_mono : mq_draw;
   s_jpg.iMaxMCUs = 1000;
   s_jpg.JPEGFile.fHandle = &s_fil;
   s_jpg.JPEGFile.iSize = (int32_t)size;
@@ -423,15 +431,36 @@ static void decode_frame(uint32_t data, uint32_t size) {
     return;
   }
   /* ucPixelType is already RGB565_LITTLE_ENDIAN (0) from the memset. */
+  if (mono) s_jpg.ucPixelType = EIGHT_BIT_GRAYSCALE;
   if (!JPEG_decode(&s_jpg, 0, 0, 0)) {
     DPRINTF("JPEG_decode failed (err %d) frame %lu\n", s_jpg.iError,
             (unsigned long)s_frame_index);
     /* Publish whatever bands landed; better than a stall. */
   }
   s_decode_us = time_us_32() - t0;
-  mq_frame_done(); /* palette for the NEXT frame, from this frame */
+  if (!mono) mq_frame_done(); /* palette for the NEXT frame, from this frame */
   if (overlay_active()) draw_overlay();
+  if (s_menu) mjpeg_menu_draw_over();
   fb_publish();    /* VBL-synced hand-off to the ST */
+}
+
+/* Decode the first video chunk at or after `p` (a chunk header offset)
+ * without moving the play position. */
+static void decode_at(uint32_t p) {
+  while (p + 8 <= s_movi_end) {
+    uint32_t fcc, size;
+    if (rd_chunk_hdr(p, &fcc, &size)) break;
+    uint32_t data = p + 8;
+    if (fcc == FCC_LIST) {
+      p = data + 4;
+      continue;
+    }
+    if ((fcc == FCC_00DC || fcc == FCC_00DB) && size) {
+      decode_frame(data, size);
+      break;
+    }
+    p = data + size + (size & 1u);
+  }
 }
 
 /* --- player ------------------------------------------------------ */
@@ -477,6 +506,7 @@ int mjpeg_open(const char *path) {
   prefill_audio();
   DPRINTF("MJPEG: primed %lu B of audio\n", (unsigned long)aring_level());
   audio_set_fill_callback(mjpeg_audio_fill);
+  fb_set_mono_levels(mq_mono_levels); /* ST high res: grey pens, dithered */
   s_open = true;
   DPRINTF("MJPEG: playing %s\n", path);
   return 0;
@@ -486,6 +516,8 @@ void mjpeg_close(void) {
   if (s_open) {
     f_close(&s_fil);
     s_open = false;
+    s_menu = false;
+    fb_set_mono_levels(NULL); /* the menu's flat pens again */
     DPRINTF("MJPEG: closed\n");
   }
   /* Drain the ring so the fill callback emits silence in the menu. */
@@ -622,23 +654,7 @@ void mjpeg_seek(int seconds) {
    * show the new frame doesn't run. (Playing: the next tick handles it.)
    * Walk to the next video chunk without disturbing s_pos, so unpausing
    * still resumes cleanly from the sought position. */
-  if (s_paused) {
-    uint32_t p = s_pos;
-    while (p + 8 <= s_movi_end) {
-      uint32_t fcc, size;
-      if (rd_chunk_hdr(p, &fcc, &size)) break;
-      uint32_t data = p + 8;
-      if (fcc == FCC_LIST) {
-        p = data + 4;
-        continue;
-      }
-      if ((fcc == FCC_00DC || fcc == FCC_00DB) && size) {
-        decode_frame(data, size);
-        break;
-      }
-      p = data + size + (size & 1u);
-    }
-  }
+  if (s_paused) decode_at(s_pos);
 }
 
 void mjpeg_toggle_pause(void) {
@@ -653,7 +669,22 @@ bool mjpeg_is_paused(void) { return s_paused; }
 void mjpeg_render_paused(void) {
   /* The chunked buffer still holds the last decoded frame (nothing
    * overwrites it while paused); draw the overlay over it and republish
-   * at VBL rate. Idempotent -- the box redraws over the same pixels. */
+   * at VBL rate. Idempotent -- the boxes redraw over the same pixels. */
   draw_overlay();
+  if (s_menu) mjpeg_menu_draw_over();
   fb_publish();
 }
+
+void mjpeg_show_menu(bool on) {
+  if (!s_open || on == s_menu) return;
+  s_menu = on;
+  mq_set_menu_pens(on);
+  /* Playing, the next frame comes without it. Paused, the menu is drawn
+   * into the frozen frame itself, so decode that frame again (the last
+   * one shown, from the seek ring). */
+  if (!on && s_paused && s_frame_index > 0) {
+    decode_at(s_frame_offsets[(s_frame_index - 1u) & (SEEK_RING - 1u)]);
+  }
+}
+
+bool mjpeg_menu_shown(void) { return s_menu; }

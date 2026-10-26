@@ -72,6 +72,11 @@ void fb_transpose(void) {
               fb_chunked_buffer + FB_CHUNKED_SIZE);
 }
 
+/* rp/src/fb_mono.c's worker, on one core. */
+void fb_transpose_mono(const uint8_t levels[16]) {
+  fb_mono_rows(fb_planar_scratch, 0, FB_CHUNKED_H, levels);
+}
+
 /* The chunk-reversed layout the m68k's predecrement MOVEM blit expects
  * (cart_shared.h): cart chunk k is scratch chunk last-k, and the tail is
  * copied as it is. fb_chunked_asm.S's fb_chunk_reverse_copy48 in C. */

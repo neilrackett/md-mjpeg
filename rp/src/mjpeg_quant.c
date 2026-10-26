@@ -17,7 +17,8 @@
  * Palette path (mq_frame_done, ~1 ms): median cut over the 512-bin
  * RGB333 histogram (the ST can only display 512 colours, so the
  * histogram is exact, not sampled), weighted-centroid palette,
- * luminance sort (index 0 = darkest = ST border colour), temporal
+ * plus black, luminance sort (index 0 = that black = the ST border, so
+ * the border stays black through every scene), temporal
  * hysteresis (slew toward the new palette, snap on scene cuts -- see
  * MQ_HYSTERESIS below), nearest-neighbour rebuild of the 512-entry map.
  *
@@ -236,7 +237,37 @@ static void publish_palette(void) {
   palette_set(st);
 }
 
+/* The menu drawn over a playing video (mq_set_menu_pens) needs two pens
+ * it can rely on. Entry 0 is always black (mq_frame_done); the lightest,
+ * which every frame re-sorts, is held at white for as long as it is up --
+ * the pixels then map around it like any other entry -- but only in what
+ * is published and mapped: pal_r/g/b, and so the hysteresis, keep the
+ * real colour. */
+static bool s_menu_pens;
+
+static void publish_and_map(void) {
+  const unsigned last = PALETTE_ENTRIES - 1u;
+  const uint8_t keep[3] = {pal_r[last], pal_g[last], pal_b[last]};
+  if (s_menu_pens) {
+    pal_r[last] = pal_g[last] = pal_b[last] = 15;
+  }
+  publish_palette();
+  build_map();
+  pal_r[last] = keep[0];
+  pal_g[last] = keep[1];
+  pal_b[last] = keep[2];
+}
+
+void mq_set_menu_pens(bool on) {
+  if (on == s_menu_pens) {
+    return;
+  }
+  s_menu_pens = on;
+  publish_and_map(); /* now, for a paused frame that won't be decoded */
+}
+
 void mq_init(void) {
+  s_menu_pens = false;
   /* Ordered dither: out = floor(c/cmax * 7 + (2*level+1)/2N), i.e. the
    * N = MQ_DITHER_N normalized thresholds are (level+0.5)/N. Integer
    * form: (c*7*2N + (2*level+1)*cmax) / (cmax*2N). For Bayer, the LUT
@@ -363,6 +394,42 @@ int __not_in_flash_func(mq_draw)(JPEGDRAW *pDraw) {
   return 1;
 }
 
+/* --- ST high res ------------------------------------------------ */
+
+/* Pen p -> level round(16 * p / 15): pen 0 all ink, 15 all paper. */
+const uint8_t mq_mono_levels[16] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                    9, 10, 11, 12, 13, 14, 15, 16};
+
+/* One grey byte a pixel in, one of 16 pens out. A mono monitor mixes
+ * light, so the pen is linear: Y^2 stands in for the encoded-to-linear
+ * curve (gamma 2), otherwise every mid grey would come out too light.
+ * (v * v * 15 + 32768) >> 16 is round(15 * (v / 255)^2) to within the
+ * 255/256 the shift gives away; 255 maps to 15. */
+int __not_in_flash_func(mq_draw_mono)(JPEGDRAW *pDraw) {
+  int w = pDraw->iWidthUsed > 0 ? pDraw->iWidthUsed : pDraw->iWidth;
+  int x0 = pDraw->x;
+  if (x0 < FB_CHUNKED_W) {
+    if (x0 + w > FB_CHUNKED_W) {
+      w = FB_CHUNKED_W - x0;
+    }
+    const uint8_t *band = (const uint8_t *)pDraw->pPixels;
+    for (int row = 0; row < pDraw->iHeight; row++) {
+      int y = pDraw->y + row;
+      if (y >= FB_CHUNKED_H) {
+        break;
+      }
+      const uint8_t *s = band + (uint32_t)row * pDraw->iWidth;
+      uint8_t *d = fb_chunked_buffer + (uint32_t)y * FB_CHUNKED_W + x0;
+      for (int i = 0; i < w; i++) {
+        uint32_t v = s[i];
+        d[i] = (uint8_t)((v * v * 15u + 32768u) >> 16);
+      }
+    }
+  }
+  mjpeg_service(); /* audio + IKBD stay alive during the decode */
+  return 1;
+}
+
 /* --- median cut ------------------------------------------------- */
 
 typedef struct {
@@ -456,8 +523,9 @@ void mq_frame_done(void) {
     return; /* nothing decoded; keep the current palette */
   }
 
+  /* One entry fewer than the palette: the last is black (below). */
   unsigned nb = 1;
-  while (nb < PALETTE_ENTRIES) {
+  while (nb < PALETTE_ENTRIES - 1u) {
     /* Split the most-populated box that still has extent. */
     int bi = -1;
     uint32_t bc = 0;
@@ -554,14 +622,21 @@ void mq_frame_done(void) {
     boost_entry(&tr[i], &tg[i], &tb[i]);
   }
 #endif
-  for (unsigned i = nb; i < PALETTE_ENTRIES; i++) {
+  for (unsigned i = nb; i < PALETTE_ENTRIES - 1u; i++) {
     tr[i] = tr[nb - 1];
     tg[i] = tg[nb - 1];
     tb[i] = tb[nb - 1];
   }
+  /* Black, always. Palette index 0 doubles as the ST border colour, and
+   * the darkest of each frame's own colours made the border change with
+   * every scene; black sorts to index 0 and keeps it black. It is added
+   * rather than put in place of the darkest colour, so the frame keeps
+   * all fifteen of its own: a bright frame loses one tone it would have
+   * had, a dark one usually wanted black anyway. */
+  tr[PALETTE_ENTRIES - 1u] = tg[PALETTE_ENTRIES - 1u] =
+      tb[PALETTE_ENTRIES - 1u] = 0;
 
-  /* Luminance sort, darkest first: palette index 0 doubles as the ST
-   * border colour, so keep it as dark as the frame allows. */
+  /* Luminance sort, darkest first, so index 0 is the black. */
   for (unsigned i = 1; i < PALETTE_ENTRIES; i++) {
     uint8_t r = tr[i], g = tg[i], b = tb[i];
     unsigned key = 3u * r + 6u * g + b;
@@ -605,7 +680,6 @@ void mq_frame_done(void) {
   memcpy(pal_b, tb, sizeof(pal_b));
 #endif
 
-  publish_palette();
-  build_map();
+  publish_and_map();
   memset(hist, 0, sizeof(hist));
 }

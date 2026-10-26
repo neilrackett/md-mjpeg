@@ -14,8 +14,9 @@
  * main loop, a MENU <-> PLAYING state machine: the menu lists the
  * .AVI files in the app folder below ABOUT and EXIT TO GEM, and reads
  * its own keys (mjpeg_menu_key); Up/Down + Return picks a video to
- * play; ESC backs out of a video to the menu, and quits to GEM from the
- * menu.
+ * play. ESC during a video opens the menu over it (the video carries
+ * on), and ESC again closes it; from the menu on its own, with nothing
+ * playing, ESC quits to GEM.
  */
 
 #include "emul.h"
@@ -137,19 +138,26 @@ void emul_start() {
       if (!k.is_press) {
         continue;
       }
-      if (state == STATE_MENU) {
+      if (state == STATE_MENU || mjpeg_menu_shown()) {
+        /* The menu, on its own or over the video, reads the keys. ESC
+         * goes back to the video if one is playing, else quits to GEM;
+         * picking a video (the playing one too) starts it afresh. */
         int sel = mjpeg_menu_key(k.scancode);
-        if (sel >= 0) {
-          mjpeg_close();
-          if (mjpeg_open(mjpeg_menu_path(sel)) == 0) {
-            state = STATE_PLAYING;
+        if (sel == MJPEG_MENU_BACK) {
+          if (state == STATE_PLAYING) {
+            mjpeg_show_menu(false);
+          } else {
+            ikbd_request_boot_gem();
           }
+        } else if (sel >= 0) {
+          mjpeg_close();
+          state = (mjpeg_open(mjpeg_menu_path(sel)) == 0) ? STATE_PLAYING
+                                                          : STATE_MENU;
         }
       } else { /* STATE_PLAYING */
         switch (k.scancode) {
           case SC_ESC:
-            mjpeg_close();
-            state = STATE_MENU;
+            mjpeg_show_menu(true); /* the menu over the video */
             break;
           case SC_LEFT:
             mjpeg_seek(-10);

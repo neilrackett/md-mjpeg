@@ -79,6 +79,13 @@ bool mjpeg_is_paused(void);
  * once per loop iteration while paused, in place of mjpeg_tick(). */
 void mjpeg_render_paused(void);
 
+/* Draw the menu (mjpeg_menu_draw_over) over every frame from now on, or
+ * stop. The video carries on underneath, paused or playing; closing it
+ * over a paused video redraws the frozen frame without it. No-op with no
+ * video open; mjpeg_close() clears it. */
+void mjpeg_show_menu(bool on);
+bool mjpeg_menu_shown(void);
+
 /* Frames successfully decoded+published since open (across loops). */
 uint32_t mjpeg_frames_shown(void);
 

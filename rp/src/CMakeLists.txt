@@ -113,6 +113,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         fb_chunked.c
         fb_chunked_asm.S
         fb_font.c
+        fb_mono.c
         gconfig.c
         ikbd.c
         hw_config.c

@@ -16,6 +16,7 @@
 #ifndef FB_H
 #define FB_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -97,6 +98,22 @@ void fb_publish(void);
  *         waiting for the VBL ack, so IKBD/ESC stay responsive during
  *         the wait. */
 void fb_pump_rom3(void);
+
+/** @brief True when the ST is in high res on a mono monitor (640x400,
+ *         one plane, 71 Hz), from the display report the m68k sends
+ *         every VBL. The cart FB is still 32000 bytes in the same
+ *         chunk-reversed layout -- 80-byte rows, 400 of them -- and a
+ *         frame is two VBLs long; fb_publish() draws the right picture
+ *         either way. */
+bool fb_st_mono(void);
+
+/** @brief How fb_publish() draws each pen in ST high res: `levels` is
+ *         16 entries of 0..16 (see fb_transpose_mono), dithered. NULL
+ *         (the default) makes each pen black or white by its brightness
+ *         in the palette slot, which suits flat-coloured screens; a
+ *         picture whose pens are a grey ramp passes a ramp. The table
+ *         must stay valid while it is set. */
+void fb_set_mono_levels(const uint8_t levels[16]);
 
 /** @brief Microseconds the most recent fb_publish() spent in the
  *         chunky-to-planar conversion (dual-core c2p + chunk-reversed
