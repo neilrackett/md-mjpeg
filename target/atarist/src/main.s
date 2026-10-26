@@ -137,14 +137,6 @@ vsync_wait          macro
 					addq.l #2,sp
                     endm    
 
-; XBIOS GetRez
-; Return the current screen resolution in D0
-get_rez				macro
-					move.w #4,-(sp)
-					trap #14
-					addq.l #2,sp
-					endm
-
 ; XBIOS Get Screen Base
 ; Return the screen memory address in D0
 get_screen_base		macro

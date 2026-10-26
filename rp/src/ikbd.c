@@ -29,11 +29,10 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 
-/* IKBD scancode for the ESC key. ESC press+release within
+/* ESC (ST_SC_ESC) press+release within
  * IKBD_ESC_RELEASE_TIMEOUT_US triggers CMD_BOOT_GEM via the cart
  * command sentinel. Single stray $01 bytes don't reliably pair with
  * an $81 release within the window, so they won't false-trigger. */
-#define IKBD_SCANCODE_ESC 0x01u
 #define IKBD_ESC_RELEASE_TIMEOUT_US 200000u  /* 200 ms */
 
 #define IKBD_RING_MASK (IKBD_RING_CAPACITY - 1u)
@@ -132,7 +131,7 @@ static void push_key(uint8_t scancode, bool is_press) {
   /* ESC press+release pair → trigger exit via the cart command
    * sentinel. Pre-swap the longword halves so m68k's move.l sees
    * the expected value (cart_asM68kLong). */
-  if (scancode == IKBD_SCANCODE_ESC) {
+  if (scancode == ST_SC_ESC) {
     if (is_press) {
       uint32_t now_us = time_us_32();
       if (now_us == 0u) now_us = 1u;  /* avoid the "no press" sentinel */

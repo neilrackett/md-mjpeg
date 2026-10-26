@@ -71,6 +71,16 @@ size_t ikbd_ring_count(void);
  * the ring was full. Should stay 0 in steady state. */
 uint32_t ikbd_ring_dropped(void);
 
+/* IKBD make scancodes the app reads. */
+#define ST_SC_ESC 0x01
+#define ST_SC_RETURN 0x1C
+#define ST_SC_SPACE 0x39
+#define ST_SC_UP 0x48
+#define ST_SC_LEFT 0x4B
+#define ST_SC_RIGHT 0x4D
+#define ST_SC_DOWN 0x50
+#define ST_SC_KP_ENTER 0x72
+
 /* Key press / release event. `scancode` is the IKBD scancode with
  * bit 7 stripped (0..127). `is_press` is true for make, false for
  * break. Scancode $00 is suppressed (not a valid IKBD key). */

@@ -25,33 +25,58 @@
 /* 640 output pixels a row, 16 to a word. */
 #define MONO_WORDS (2u * FB_CHUNKED_W / 16u)
 
-void fb_mono_rows(uint16_t *scratch, unsigned y0, unsigned y1,
-                  const uint8_t levels[16]) {
+/* One 16-pixel run of a tile row as ink masks, one per level 0..16:
+ * masks[l] has bit 15 - x set where the threshold t[x] >= l, i.e. where
+ * a pixel at level l is ink (0 all ink, 16 all paper). */
+static void ink_masks(const uint8_t *t, uint16_t masks[17]) {
+  uint16_t at[16] = {0};
+  for (unsigned x = 0; x < 16u; x++) {
+    at[t[x]] |= (uint16_t)(0x8000u >> x);
+  }
+  masks[16] = 0;
+  for (int l = 15; l >= 0; l--) {
+    masks[l] = masks[l + 1] | at[l];
+  }
+}
+
+/* For each half of the 32-pixel tile, each pen as ink bits across the
+ * half's 16 output pixels of source row y: the top output row in the
+ * high half of the word, the bottom row in the low. Once a row, so it
+ * stays in flash; only the per-pixel loop below is RAM-resident. */
+static void __attribute__((noinline))
+row_pen_bits(unsigned y, const uint8_t levels[16], uint32_t pen_bits[2][16]) {
+  for (unsigned h = 0; h < 2u; h++) {
+    uint16_t top[17], bot[17];
+    ink_masks(&bluenoise[((2u * y) & (BLUENOISE_N - 1u)) * BLUENOISE_N +
+                         16u * h],
+              top);
+    ink_masks(&bluenoise[((2u * y + 1u) & (BLUENOISE_N - 1u)) * BLUENOISE_N +
+                         16u * h],
+              bot);
+    for (unsigned p = 0; p < 16u; p++) {
+      pen_bits[h][p] = ((uint32_t)top[levels[p]] << 16) | bot[levels[p]];
+    }
+  }
+}
+
+void __not_in_flash_func(fb_mono_rows)(uint16_t *scratch, unsigned y0,
+                                       unsigned y1, const uint8_t levels[16]) {
   for (unsigned y = y0; y < y1; y++) {
+    /* Eight source pixels make one word of each output row, each taking
+     * its two columns of its pen's bits. */
+    uint32_t pen_bits[2][16];
+    row_pen_bits(y, levels, pen_bits);
     const uint8_t *src = fb_chunked_buffer + y * FB_CHUNKED_W;
-    const uint8_t *t0 =
-        &bluenoise[((2u * y) & (BLUENOISE_N - 1u)) * BLUENOISE_N];
-    const uint8_t *t1 =
-        &bluenoise[((2u * y + 1u) & (BLUENOISE_N - 1u)) * BLUENOISE_N];
     uint16_t *d0 = scratch + 2u * y * MONO_WORDS;
     uint16_t *d1 = d0 + MONO_WORDS;
     for (unsigned w = 0; w < MONO_WORDS; w++, src += 8) {
-      /* Eight source pixels make one word of each output row; the word
-       * covers tile columns 0..15 or 16..31. A pixel is ink where its
-       * level does not clear the threshold (levels 0..16, thresholds
-       * 0..15, so 0 is all ink and 16 all paper). */
-      const uint8_t *a = t0 + (w & 1u) * 16u;
-      const uint8_t *b = t1 + (w & 1u) * 16u;
-      uint32_t top = 0, bot = 0;
-      for (unsigned i = 0; i < 8u; i++) {
-        const unsigned l = levels[src[i] & 15u];
-        top = (top << 2) | ((uint32_t)(l <= a[2u * i]) << 1) |
-              (uint32_t)(l <= a[2u * i + 1u]);
-        bot = (bot << 2) | ((uint32_t)(l <= b[2u * i]) << 1) |
-              (uint32_t)(l <= b[2u * i + 1u]);
+      const uint32_t *pb = pen_bits[w & 1u];
+      uint32_t acc = 0, m = 0xC000C000u;
+      for (unsigned i = 0; i < 8u; i++, m >>= 2) {
+        acc |= pb[src[i] & 15u] & m;
       }
-      d0[w] = (uint16_t)top;
-      d1[w] = (uint16_t)bot;
+      d0[w] = (uint16_t)(acc >> 16);
+      d1[w] = (uint16_t)acc;
     }
   }
 }

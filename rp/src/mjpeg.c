@@ -506,7 +506,6 @@ int mjpeg_open(const char *path) {
   prefill_audio();
   DPRINTF("MJPEG: primed %lu B of audio\n", (unsigned long)aring_level());
   audio_set_fill_callback(mjpeg_audio_fill);
-  fb_set_mono_levels(mq_mono_levels); /* ST high res: grey pens, dithered */
   s_open = true;
   DPRINTF("MJPEG: playing %s\n", path);
   return 0;
@@ -517,7 +516,6 @@ void mjpeg_close(void) {
     f_close(&s_fil);
     s_open = false;
     s_menu = false;
-    fb_set_mono_levels(NULL); /* the menu's flat pens again */
     DPRINTF("MJPEG: closed\n");
   }
   /* Drain the ring so the fill callback emits silence in the menu. */
@@ -678,7 +676,7 @@ void mjpeg_render_paused(void) {
 void mjpeg_show_menu(bool on) {
   if (!s_open || on == s_menu) return;
   s_menu = on;
-  mq_set_menu_pens(on);
+  mq_republish(); /* entry 15 held at white while it is up */
   /* Playing, the next frame comes without it. Paused, the menu is drawn
    * into the frozen frame itself, so decode that frame again (the last
    * one shown, from the seek ring). */

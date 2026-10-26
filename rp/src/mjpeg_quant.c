@@ -237,18 +237,16 @@ static void publish_palette(void) {
   palette_set(st);
 }
 
-/* The menu drawn over a playing video (mq_set_menu_pens) needs two pens
+/* The menu drawn over a playing video (mjpeg_menu_shown) needs two pens
  * it can rely on. Entry 0 is always black (mq_frame_done); the lightest,
  * which every frame re-sorts, is held at white for as long as it is up --
  * the pixels then map around it like any other entry -- but only in what
  * is published and mapped: pal_r/g/b, and so the hysteresis, keep the
  * real colour. */
-static bool s_menu_pens;
-
 static void publish_and_map(void) {
   const unsigned last = PALETTE_ENTRIES - 1u;
   const uint8_t keep[3] = {pal_r[last], pal_g[last], pal_b[last]};
-  if (s_menu_pens) {
+  if (mjpeg_menu_shown()) {
     pal_r[last] = pal_g[last] = pal_b[last] = 15;
   }
   publish_palette();
@@ -258,16 +256,9 @@ static void publish_and_map(void) {
   pal_b[last] = keep[2];
 }
 
-void mq_set_menu_pens(bool on) {
-  if (on == s_menu_pens) {
-    return;
-  }
-  s_menu_pens = on;
-  publish_and_map(); /* now, for a paused frame that won't be decoded */
-}
+void mq_republish(void) { publish_and_map(); }
 
 void mq_init(void) {
-  s_menu_pens = false;
   /* Ordered dither: out = floor(c/cmax * 7 + (2*level+1)/2N), i.e. the
    * N = MQ_DITHER_N normalized thresholds are (level+0.5)/N. Integer
    * form: (c*7*2N + (2*level+1)*cmax) / (cmax*2N). For Bayer, the LUT
@@ -395,10 +386,6 @@ int __not_in_flash_func(mq_draw)(JPEGDRAW *pDraw) {
 }
 
 /* --- ST high res ------------------------------------------------ */
-
-/* Pen p -> level round(16 * p / 15): pen 0 all ink, 15 all paper. */
-const uint8_t mq_mono_levels[16] = {0, 1, 2,  3,  4,  5,  6,  7,
-                                    9, 10, 11, 12, 13, 14, 15, 16};
 
 /* One grey byte a pixel in, one of 16 pens out. A mono monitor mixes
  * light, so the pen is linear: Y^2 stands in for the encoded-to-linear

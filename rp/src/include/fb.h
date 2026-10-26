@@ -107,13 +107,11 @@ void fb_pump_rom3(void);
  *         either way. */
 bool fb_st_mono(void);
 
-/** @brief How fb_publish() draws each pen in ST high res: `levels` is
- *         16 entries of 0..16 (see fb_transpose_mono), dithered. NULL
- *         (the default) makes each pen black or white by its brightness
- *         in the palette slot, which suits flat-coloured screens; a
- *         picture whose pens are a grey ramp passes a ramp. The table
- *         must stay valid while it is set. */
-void fb_set_mono_levels(const uint8_t levels[16]);
+/** @brief fb_publish(), choosing how each pen is drawn in ST high res:
+ *         `levels` is 16 entries of 0..16 (see fb_transpose_mono),
+ *         dithered; ignored in colour. fb_publish() itself draws the pens
+ *         as an even grey ramp, 0 black to 15 white. */
+void fb_publish_levels(const uint8_t levels[16]);
 
 /** @brief Microseconds the most recent fb_publish() spent in the
  *         chunky-to-planar conversion (dual-core c2p + chunk-reversed

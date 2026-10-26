@@ -111,19 +111,12 @@ void emul_start() {
 
   select_configure();
 
-  /* The menu owns the ESC key: ESC backs out of a playing video to the
-   * menu, and quits to GEM only from the top-level menu. */
+  /* The app owns the ESC key: ESC during a video opens the menu over it,
+   * and quits to GEM only from the menu with nothing playing. */
   ikbd_set_esc_auto_exit(false);
   mjpeg_menu_init(sd_ok ? folderName : "/");
   cart_check("post-menu-init");
 
-  /* IKBD make scancodes for playback (the menu reads its own keys). */
-  enum {
-    SC_ESC = 0x01,
-    SC_SPACE = 0x39,
-    SC_LEFT = 0x4B,
-    SC_RIGHT = 0x4D,
-  };
   enum { STATE_MENU, STATE_PLAYING } state = STATE_MENU;
 
   /* --- main loop --- */
@@ -156,16 +149,16 @@ void emul_start() {
         }
       } else { /* STATE_PLAYING */
         switch (k.scancode) {
-          case SC_ESC:
+          case ST_SC_ESC:
             mjpeg_show_menu(true); /* the menu over the video */
             break;
-          case SC_LEFT:
+          case ST_SC_LEFT:
             mjpeg_seek(-10);
             break;
-          case SC_RIGHT:
+          case ST_SC_RIGHT:
             mjpeg_seek(10);
             break;
-          case SC_SPACE:
+          case ST_SC_SPACE:
             mjpeg_toggle_pause();
             break;
           default:

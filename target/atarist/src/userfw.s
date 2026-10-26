@@ -398,10 +398,6 @@ IKBD_WINDOW_BASE      equ $FB8200
 ; IKBD window ($82) so the RP can tell the two apart. The value read
 ; is irrelevant; only the address matters.
 VBLSYNC_ADDR          equ $FB8400
-; Mono only: the ack for the first half of a frame. The cart FB is not
-; free yet -- half of it has still to be copied -- so the RP must not
-; take it as a frame ack. The RP tells the two apart by the low byte.
-VBLSYNC_HALF_ADDR     equ (VBLSYNC_ADDR + 1)
 
 ; Display report: the m68k reads (VIDEO_WINDOW_BASE + UFW_MONO) once per
 ; VBL, so the RP knows which picture to draw and how much audio a 71 Hz
@@ -813,14 +809,10 @@ userfw:
     move.b  d2, STE_DMA_END_HI.w
 .no_dma_refill:
 
-    ; Half a mono frame: no flip, and an ack that only says "a VBL went
-    ; by" -- the RP must not take the cart FB as free, because the rest
-    ; is copied out of it next VBL.
+    ; Half a mono frame: no flip and no ack -- the cart FB is not free,
+    ; because the rest is copied out of it next VBL.
     tst.b   UFW_HALF
-    beq.s   .frame_done
-    tst.b   VBLSYNC_HALF_ADDR
-    bra.s   .input_check
-.frame_done:
+    bne.s   .input_check
 
     ; Flip the video base to the just-written page. A5 still holds
     ; UFW_SCREEN_PAGE (preserved by FBDRV_INLINE). Only the MID byte

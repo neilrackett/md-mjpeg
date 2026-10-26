@@ -36,26 +36,14 @@ extern const struct FB_FONT font8x8; /* defined in fb.c */
 #define MENU_MAX_FILES 20
 #define MENU_NAME_LEN 48
 
-/* IKBD make scancodes the menu reads. */
-enum {
-  SC_ESC = 0x01,
-  SC_RETURN = 0x1C,
-  SC_SPACE = 0x39,
-  SC_UP = 0x48,
-  SC_DOWN = 0x50,
-  SC_KP_ENTER = 0x72,
-};
-
 /* Font cell metrics (font8x8): 40 columns x 25 rows over 320x200. */
 #define CELL_W 8
 #define CELL_H 8
-#define TEXT_COLS (FB_CHUNKED_W / CELL_W)
 
 /* Menu palette. Index 0 also drives the ST border, so black takes it:
  * the screen around the box and the border beyond it are then the
  * same, and the box reads as a box. The menu itself is two pens, navy
- * and white, like MiSTer's OSD: everything is ink on the fill, and the
- * strip and the selection bar are the fill on ink. */
+ * and white (see struct menu_style). */
 #define PEN_BG 0
 #define PEN_INK 1
 #define PEN_PANEL 6
@@ -73,7 +61,7 @@ static const uint16_t MenuPalette[PALETTE_ENTRIES] = {
     PALETTE_RGB(0, 0, 0),
 };
 
-/* ST high res (fb_set_mono_levels): black and white alone would lose the
+/* ST high res (fb_publish_levels): black and white alone would lose the
  * box against the screen around it, so the screen takes a third tone, a
  * 50% grey dither, and the box is black with white ink. */
 static const uint8_t MenuMonoLevels[PALETTE_ENTRIES] = {
@@ -87,7 +75,7 @@ static int s_count;
 static char s_home[64];   /* the configured folder, for the empty message */
 static char s_folder[64]; /* where the list came from (may be the root) */
 static char s_path[300];
-static int s_selected;    /* >= 0 video index, < 0 settings item */
+static int s_row;         /* the selected row (see Navigation) */
 static bool s_about;      /* the About page is up */
 
 /* Append every real *.AVI in `folder` to the list (up to the cap).
@@ -134,61 +122,29 @@ static void menu_sort(void) {
 
 /* ============================== Navigation =============================== */
 
-#define UI_ITEM_ABOUT 0
-#define UI_ITEM_EXIT 1
-#define UI_ITEM_COUNT 2
-
-/* The menu is one flat list with the settings block on top and the
- * videos below, as in MD/Lynx. The selection is a signed index (>= 0
- * video, -1 - item for a setting), so the settings occupy rows
- * 0..UI_ITEM_COUNT-1 in reverse declaration order: EXIT heads the list
- * and ABOUT sits just above the first video.
- *
- * A blank, unselectable row separates the two groups -- but only when
- * there are videos to separate from, hence menu_gap(). */
-static int menu_gap(void) { return s_count > 0 ? 1 : 0; }
-static int menu_rows_total(void) { return UI_ITEM_COUNT + menu_gap() + s_count; }
-static bool row_is_gap(int row) { return menu_gap() && row == UI_ITEM_COUNT; }
-static int sel_to_row(int sel) {
-  return (sel >= 0) ? sel + UI_ITEM_COUNT + menu_gap() : sel + UI_ITEM_COUNT;
-}
-static int row_to_sel(int row) {
-  return (row > UI_ITEM_COUNT) ? row - UI_ITEM_COUNT - menu_gap()
-                               : row - UI_ITEM_COUNT;
-}
-
-static void ui_move(int dir) {
-  const int total = menu_rows_total();
-  int row = sel_to_row(s_selected) + dir;
-  /* Wrap, then step over the separator if we landed on it. Bounded by
-   * `total` so a list that were somehow all gaps still terminates. */
-  for (int guard = 0; guard <= total; guard++) {
-    if (row < 0) {
-      row = total - 1;
-    } else if (row >= total) {
-      row = 0;
-    }
-    if (!row_is_gap(row)) break;
-    row += dir;
-  }
-  s_selected = row_to_sel(row);
-}
+/* The menu is one flat list, as in MD/Lynx: the settings rows on top,
+ * then -- when there are videos -- a blank, unselectable row, then the
+ * videos. The selection is simply a row. */
+#define ROW_EXIT 0
+#define ROW_ABOUT 1
+#define ROW_SETTINGS 2
 
 /* Each setting reads the way MiSTer's do: its name on the left and its
  * value, if it has one, right-aligned against the far edge. */
-static const char *settings_label(int item) {
-  switch (item) {
-    case UI_ITEM_ABOUT:
-      return "ABOUT";
-    case UI_ITEM_EXIT:
-      return "EXIT TO GEM";
-    default:
-      return "";
-  }
-}
+static const char *const SettingsLabel[ROW_SETTINGS] = {"EXIT TO GEM",
+                                                        "ABOUT"};
+static const char *const SettingsValue[ROW_SETTINGS] = {"", RELEASE_VERSION};
 
-static const char *settings_value(int item) {
-  return (item == UI_ITEM_ABOUT) ? RELEASE_VERSION : "";
+static int first_video_row(void) { return ROW_SETTINGS + (s_count > 0); }
+static int menu_rows_total(void) { return first_video_row() + s_count; }
+static bool row_is_gap(int row) { return s_count > 0 && row == ROW_SETTINGS; }
+
+/* Up or down one row, wrapping, and over the gap (never at either end). */
+static void ui_move(int dir) {
+  const int total = menu_rows_total();
+  int row = (s_row + dir + total) % total;
+  if (row_is_gap(row)) row += dir;
+  s_row = row;
 }
 
 /* ================================ Drawing ================================ */
@@ -221,7 +177,7 @@ struct menu_style {
 
 /* On its own the menu has its own palette's navy and white. Over a
  * video it has the frame's pens 0 and 15: the quantizer's 0 is always
- * black and it holds 15 at white while the menu is up (mq_set_menu_pens),
+ * black and it holds 15 at white while the menu is up (mq_republish),
  * and mono's grey ramp makes them black and white anyway. */
 static const struct menu_style MenuOwn = {PEN_PANEL, PEN_INK};
 static const struct menu_style MenuOverVideo = {0, PALETTE_ENTRIES - 1};
@@ -301,41 +257,39 @@ static void display_name(const char *name, char *out, size_t cap) {
 
 static void draw_menu(const struct menu_style *st) {
   const int total = menu_rows_total();
-  int first = sel_to_row(s_selected) - MENU_ROWS / 2;
+  int first = s_row - MENU_ROWS / 2;
   if (first > total - MENU_ROWS) first = total - MENU_ROWS;
   if (first < 0) first = 0;
 
   draw_box(st, first > 0, first + MENU_ROWS < total);
 
-  char line[TEXT_COLS + 1];
+  char line[MENU_NAME_LEN];
   for (int i = 0; i < MENU_ROWS; i++) {
-    const int row_idx = first + i;
-    if (row_idx >= total) break;
-    if (row_is_gap(row_idx)) continue; /* separator: nothing to draw */
+    const int row = first + i;
+    if (row >= total) break;
+    if (row_is_gap(row)) continue; /* separator: nothing to draw */
     const int y = MENU_ROW_Y(i);
-    const int item = row_to_sel(row_idx);
 
     /* The selected row is inverted right across the list, hard against
      * the strip, as MiSTer draws it. */
     uint8_t pen = st->ink;
-    if (item == s_selected) {
+    if (row == s_row) {
       fb_fill_rect(MENU_LIST_X, y, MENU_LIST_W, CELL_H, st->ink);
       pen = st->bg;
     }
 
-    if (item >= 0) {
-      display_name(s_names[item], line, sizeof(line));
+    if (row >= ROW_SETTINGS) {
+      display_name(s_names[row - first_video_row()], line, sizeof(line));
       text_px(MENU_TEXT_X, y, pen, line, FONT_ALIGN_LEFT);
     } else {
-      text_px(MENU_TEXT_X, y, pen, settings_label(-item - 1), FONT_ALIGN_LEFT);
-      text_px(MENU_TEXT_R, y, pen, settings_value(-item - 1),
-              FONT_ALIGN_RIGHT);
+      text_px(MENU_TEXT_X, y, pen, SettingsLabel[row], FONT_ALIGN_LEFT);
+      text_px(MENU_TEXT_R, y, pen, SettingsValue[row], FONT_ALIGN_RIGHT);
     }
   }
 
   if (s_count == 0) {
-    menu_centred(st, UI_ITEM_COUNT + 1, "NO .AVI FILES");
-    menu_centred(st, UI_ITEM_COUNT + 2, s_home);
+    menu_centred(st, ROW_SETTINGS + 1, "NO .AVI FILES");
+    menu_centred(st, ROW_SETTINGS + 2, s_home);
   }
 }
 
@@ -368,6 +322,14 @@ static void draw_about(const struct menu_style *st) {
   menu_centred(st, MENU_ROWS - 1, "PRESS ANY KEY");
 }
 
+static void draw(const struct menu_style *st) {
+  if (s_about) {
+    draw_about(st);
+  } else {
+    draw_menu(st);
+  }
+}
+
 /* ================================== API ================================== */
 
 void mjpeg_menu_init(const char *folder) {
@@ -382,7 +344,7 @@ void mjpeg_menu_init(const char *folder) {
   }
   menu_sort();
   /* Open on the first video, with the settings scrolled above it. */
-  s_selected = (s_count > 0) ? 0 : -1 - UI_ITEM_ABOUT;
+  s_row = (s_count > 0) ? first_video_row() : ROW_ABOUT;
   s_about = false;
 }
 
@@ -404,23 +366,23 @@ int mjpeg_menu_key(uint8_t scancode) {
     return MJPEG_MENU_NONE;
   }
   switch (scancode) {
-    case SC_UP:
+    case ST_SC_UP:
       ui_move(-1);
       break;
-    case SC_DOWN:
+    case ST_SC_DOWN:
       ui_move(1);
       break;
-    case SC_RETURN:
-    case SC_KP_ENTER:
-    case SC_SPACE:
-      if (s_selected >= 0) return s_selected;
-      if (s_selected == -1 - UI_ITEM_ABOUT) {
+    case ST_SC_RETURN:
+    case ST_SC_KP_ENTER:
+    case ST_SC_SPACE:
+      if (s_row >= ROW_SETTINGS) return s_row - first_video_row();
+      if (s_row == ROW_ABOUT) {
         s_about = true;
-      } else if (s_selected == -1 - UI_ITEM_EXIT) {
-        ikbd_request_boot_gem();
+      } else {
+        ikbd_request_boot_gem(); /* ROW_EXIT */
       }
       break;
-    case SC_ESC:
+    case ST_SC_ESC:
       return MJPEG_MENU_BACK; /* the caller's: back to the video, or GEM */
     default:
       break;
@@ -433,21 +395,8 @@ void mjpeg_menu_render(void) {
    * left in place. */
   palette_set(MenuPalette);
   fb_chunked_clear(PEN_BG);
-  if (s_about) {
-    draw_about(&MenuOwn);
-  } else {
-    draw_menu(&MenuOwn);
-  }
-  font_align(FONT_ALIGN_LEFT);
-  fb_set_mono_levels(MenuMonoLevels);
-  fb_publish();
+  draw(&MenuOwn);
+  fb_publish_levels(MenuMonoLevels);
 }
 
-void mjpeg_menu_draw_over(void) {
-  if (s_about) {
-    draw_about(&MenuOverVideo);
-  } else {
-    draw_menu(&MenuOverVideo);
-  }
-  font_align(FONT_ALIGN_LEFT);
-}
+void mjpeg_menu_draw_over(void) { draw(&MenuOverVideo); }

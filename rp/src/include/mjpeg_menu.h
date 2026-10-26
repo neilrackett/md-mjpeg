@@ -52,7 +52,7 @@ int mjpeg_menu_key(uint8_t scancode);
 void mjpeg_menu_render(void);
 
 /* Draw the menu (or the About page) over the frame in fb_chunked_buffer,
- * in the frame's pens 0 and 15 (see mq_set_menu_pens); the caller
+ * in the frame's pens 0 and 15 (see mq_republish); the caller
  * publishes. For the menu over a playing video. */
 void mjpeg_menu_draw_over(void);
 

@@ -34,10 +34,10 @@
  * routes ROM3 samples to both the IKBD demux and this detector;
  * fb_publish() blocks until s_vbl_seen advances before overwriting
  * the cart FB. The ~33 ms timeout keeps the RP from hanging if the
- * m68k isn't emitting acks (e.g. before it boots). Only $FB8400 itself
- * is a frame ack: in mono the m68k reads $FB8401 after copying the
- * first half of a frame, which leaves the other half still to be read. */
+ * m68k isn't emitting acks (e.g. before it boots). In mono only the VBL
+ * that ends a frame acks; the one after the first half does not. */
 #define FB_VBLSYNC_HIBYTE   0x8400u
+#define FB_VBLSYNC_HIMASK   0xFF00u
 /* Sound-capability report window ($FB8600 = YM, $FB8601 = DMA). */
 #define FB_SNDCAP_HIBYTE    0x8600u
 #define FB_SNDCAP_HIMASK    0xFF00u
@@ -55,7 +55,6 @@
 static volatile uint32_t s_vbl_seen;
 static uint32_t s_vbl_published;
 static volatile bool s_st_mono;
-static const uint8_t *s_mono_levels; /* NULL: pens by the palette slot */
 
 /* Demo sprite. Multi-colour 16x16 ball with a transparent
  * background (key = 0xFF; transparent corners give it a rounded look
@@ -267,7 +266,7 @@ void fb_render_frame(void) {
  * demux and to the VBL frame-sync detector. */
 static void fb_rom3_dispatch(uint16_t sample) {
   ikbd_consume_rom3_sample(sample);
-  if (sample == FB_VBLSYNC_HIBYTE) {
+  if ((sample & FB_VBLSYNC_HIMASK) == FB_VBLSYNC_HIBYTE) {
     s_vbl_seen++;
   }
   if ((sample & FB_VIDEO_HIMASK) == FB_VIDEO_HIBYTE) {
@@ -286,22 +285,14 @@ void fb_pump_rom3(void) { commemul_poll(fb_rom3_dispatch); }
 
 bool fb_st_mono(void) { return s_st_mono; }
 
-void fb_set_mono_levels(const uint8_t levels[16]) { s_mono_levels = levels; }
+/* fb_publish()'s ST high res levels: the pens an even grey ramp, pen p
+ * round(16 * p / 15) -- 0 all ink, 15 all paper. */
+static const uint8_t fb_mono_ramp[16] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                         9, 10, 11, 12, 13, 14, 15, 16};
 
-/* ST high res with no level table set: each pen is black ink or white
- * paper by its brightness in the cart palette slot (no dither, so the
- * flat colours of a menu stay flat). */
-static void fb_mono_levels_from_palette(uint8_t levels[CART_PALETTE_ENTRIES]) {
-  const uint16_t *pal = (const uint16_t *)((uintptr_t)&__rom_in_ram_start__ +
-                                           CART_PALETTE_OFFSET);
-  for (unsigned i = 0; i < CART_PALETTE_ENTRIES; i++) {
-    const unsigned v = pal[i];
-    const unsigned sum = ((v >> 8) & 7u) + ((v >> 4) & 7u) + (v & 7u);
-    levels[i] = (sum < 11u) ? 0u : 16u;
-  }
-}
+void fb_publish(void) { fb_publish_levels(fb_mono_ramp); }
 
-void fb_publish(void) {
+void fb_publish_levels(const uint8_t levels[16]) {
   /* 1. Transpose chunked -> planar SCRATCH (RP RAM, dual-core). This is
    *    the slow part (~1 ms) but it does NOT touch the cart FB, so it
    *    runs unsynchronized and overlaps the m68k's blit of the previous
@@ -309,12 +300,6 @@ void fb_publish(void) {
    *    the same size. */
   uint32_t t0 = time_us_32();
   if (s_st_mono) {
-    uint8_t from_palette[CART_PALETTE_ENTRIES];
-    const uint8_t *levels = s_mono_levels;
-    if (levels == NULL) {
-      fb_mono_levels_from_palette(from_palette);
-      levels = from_palette;
-    }
     fb_transpose_mono(levels);
   } else {
     fb_transpose();

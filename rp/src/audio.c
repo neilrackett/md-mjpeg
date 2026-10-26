@@ -50,11 +50,11 @@
 #define AUDIO_FILL_BYTES_DMA_MONO 350u
 
 static audio_mode_t s_audio_mode = AUDIO_MODE_SILENT;
-static uint32_t s_fill_bytes = AUDIO_FILL_BYTES_DMA;
 static bool s_st_mono;
 
-static uint32_t fill_bytes_for(audio_mode_t mode) {
-  if (mode == AUDIO_MODE_YM) {
+/* The per-VBL refill size for the current back-end and VBL rate. */
+static uint32_t fill_bytes(void) {
+  if (s_audio_mode == AUDIO_MODE_YM) {
     return s_st_mono ? AUDIO_FILL_BYTES_YM_MONO : AUDIO_FILL_BYTES_YM;
   }
   return s_st_mono ? AUDIO_FILL_BYTES_DMA_MONO : AUDIO_FILL_BYTES_DMA;
@@ -65,12 +65,11 @@ void audio_set_mode(audio_mode_t mode) {
     return;
   }
   s_audio_mode = mode;
-  s_fill_bytes = fill_bytes_for(mode);
   DPRINTF("audio_set_mode: %s (%u B/VBL)\n",
           mode == AUDIO_MODE_DMA ? "STE DMA" : mode == AUDIO_MODE_YM
                                                    ? "YM"
                                                    : "silent",
-          (unsigned)s_fill_bytes);
+          (unsigned)fill_bytes());
 }
 
 void audio_set_mono(bool mono) {
@@ -78,9 +77,8 @@ void audio_set_mono(bool mono) {
     return;
   }
   s_st_mono = mono;
-  s_fill_bytes = fill_bytes_for(s_audio_mode);
   DPRINTF("audio_set_mono: %s VBLs (%u B/VBL)\n", mono ? "71 Hz" : "50 Hz",
-          (unsigned)s_fill_bytes);
+          (unsigned)fill_bytes());
 }
 
 audio_mode_t audio_get_mode(void) { return s_audio_mode; }
@@ -123,7 +121,7 @@ void audio_init(void) {
 
   DPRINTF("audio_init: cart buffer %u B at offset $%04X, %u B/VBL refill\n",
           (unsigned)CART_AUDIO_BUFFER_SIZE,
-          (unsigned)CART_AUDIO_BUFFER_OFFSET, (unsigned)s_fill_bytes);
+          (unsigned)CART_AUDIO_BUFFER_OFFSET, (unsigned)fill_bytes());
 }
 
 void audio_set_fill_callback(audio_fill_cb_t cb) {
@@ -246,5 +244,5 @@ void audio_render_frame(void) {
   }
   s_last_frame_us = now_us;
 
-  s_fill_cb(s_audio_buf, s_fill_bytes);
+  s_fill_cb(s_audio_buf, fill_bytes());
 }

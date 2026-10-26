@@ -62,6 +62,15 @@ extern void fb_c2p_half(uint16_t *dst,
 static uint16_t fb_planar_scratch[CART_FRAMEBUFFER_SIZE / sizeof(uint16_t)]
     __attribute__((aligned(4)));
 
+/* EmuMD's host build has 64-bit pointers, which cannot ride the 32-bit
+ * FIFO: there the job and its argument wait in a slot and the FIFO only
+ * says when (its lock orders the slot). One job at a time either way --
+ * dispatch and wait always pair. */
+#if UINTPTR_MAX > UINT32_MAX
+static fb_core1_job_t s_job;
+static void *s_job_arg;
+#endif
+
 /* Generic Core 1 worker loop (dual-core). Pops a job function
  * pointer + arg off the FIFO, runs it, signals completion. Both the c2p
  * bottom half and the demos' band rendering dispatch through this. The
@@ -70,16 +79,28 @@ static uint16_t fb_planar_scratch[CART_FRAMEBUFFER_SIZE / sizeof(uint16_t)]
  * doesn't pay XIP cost on every dispatch. */
 static void __not_in_flash_func(fb_core1_loop)(void) {
   for (;;) {
+#if UINTPTR_MAX > UINT32_MAX
+    (void)multicore_fifo_pop_blocking();
+    fb_core1_job_t job = s_job;
+    void *arg = s_job_arg;
+#else
     fb_core1_job_t job = (fb_core1_job_t)(uintptr_t)multicore_fifo_pop_blocking();
     void *arg = (void *)(uintptr_t)multicore_fifo_pop_blocking();
+#endif
     job(arg);
     multicore_fifo_push_blocking(0); /* done */
   }
 }
 
 void __not_in_flash_func(fb_core1_dispatch)(fb_core1_job_t job, void *arg) {
+#if UINTPTR_MAX > UINT32_MAX
+  s_job = job;
+  s_job_arg = arg;
+  multicore_fifo_push_blocking(1);
+#else
   multicore_fifo_push_blocking((uint32_t)(uintptr_t)job);
   multicore_fifo_push_blocking((uint32_t)(uintptr_t)arg);
+#endif
 }
 
 void __not_in_flash_func(fb_core1_wait)(void) {
