@@ -76,3 +76,6 @@ uuid.txt
 tmp/
 screenlog.*
 .DS_Store
+
+# The emulated SD card (EmuMD): videos are local media
+/emu/sd/

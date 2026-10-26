@@ -10,3 +10,6 @@
 [submodule "jpegdec"]
 	path = jpegdec
 	url = https://github.com/bitbank2/JPEGDEC.git
+[submodule "emu/emumd"]
+	path = emu/emumd
+	url = https://github.com/neilrackett/emumd.git

@@ -49,6 +49,20 @@ An optional third argument sets the MJPEG quality (2 = best, 31 = worst, default
 
 By default the audio is encoded at 5.6 kHz for the YM2149. If you have an STE, prefix `STE=1` (e.g. `STE=1 tools/video_to_avi.sh in.mp4 out.avi`) to encode 25 kHz audio for the STE's DMA sound chip — it still plays on a plain ST (downsampled), so it's the safe choice if any of your machines is an STE.
 
+## Running it on your computer
+
+You can also run MD/MJPEG on your Mac or Linux PC, no SidecarT required, using [EmuMD](https://github.com/neilrackett/emumd) in the `emu/emumd` submodule. It builds the firmware for your computer and runs it in a version of [Hatari](https://www.hatari-emu.org) with a Multi-device on its cartridge port, with a folder standing in for the microSD card. You'll need the tools in [EmuMD's README](https://github.com/neilrackett/emumd#getting-started), and your converted videos in `emu/sd/mjpeg`, then:
+
+```bash
+git submodule update --init emu/emumd  # once, if you cloned without it
+emu/emumd/tools/mdfw hatari            # once: builds EmuMD's Hatari, downloads EmuTOS
+make emu                               # builds and runs MD/MJPEG in Hatari (an STE)
+make emu MACHINE=st                    # a plain ST, with YM sound
+make emu RECORD=mjpeg.avi              # records picture and sound until you quit
+```
+
+EmuMD boots EmuTOS unless you give it another TOS image with `TOS=/path/to/tos.img`. Add `-V` to `emu/emumd/tools/mdfw run` to see the firmware's debug output. It's great for testing the menu, the AVI parser, the colour pipeline and the code that talks to the ST, but the emulated Multi-device has all the speed and memory it wants, so decode times, dropped frames and running out of RAM still need real hardware.
+
 ## Known limitations
 
 - Colour systems only (ST low-res, 320×200); high-res mono screens fall back to GEM.

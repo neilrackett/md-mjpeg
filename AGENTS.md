@@ -47,6 +47,7 @@ make build     # release UF2 -> dist/<uuid>-<version>.uf2 (uuid from uuid.txt)
 make debug     # same but DEBUG_MODE=1 (UART logging on; see boot-race lesson)
 make uart-log  # attach serial console, log to ./screenlog.0
 make tag       # tag HEAD with version.txt and push (release workflow)
+make emu       # build for the host and run in Hatari via EmuMD (see below)
 ```
 
 - UUID resolution: `APP_UUID_KEY` env → `uuid.txt` (gitignored) → dev default
@@ -108,7 +109,8 @@ make tag       # tag HEAD with version.txt and push (release workflow)
   console + on-screen diagnostics. Offline validation patterns that worked:
   compile `jpeg.inl` + the exact decode/draw code as a host binary against
   the real AVI (see "host_decode_test" pattern), and mirror the quantizer in
-  Python to render preview PNGs.
+  Python to render preview PNGs. Before any of that, the EmuMD build (below)
+  runs the whole app in Hatari on the host.
 
 ### Video encoding contract
 
@@ -123,6 +125,57 @@ everywhere and is the right choice if any target is an STE. `hqdn3d` denoise +
 a decode-speed dial**: measured on hardware, q7 ≈ 52–76 ms/frame (~16 fps
 effective, ~1/3 frames skipped), q11+denoise ≈ ~30 % faster (~40 ms ≈ 25 fps).
 The 16-colour dither masks most of the quality difference — prefer higher q.
+
+### EmuMD: MD/MJPEG in Hatari, on the host
+
+[EmuMD](https://github.com/neilrackett/emumd) (the `emu/emumd` submodule; its
+skill is `emu/emumd/skills/emumd/SKILL.md`) builds the RP-side C, JPEGDEC
+included, for the host as `build/md-mjpeg.mdfw` and runs it in a patched
+Hatari, with the real m68k cartridge (`target_firmware.h`, so whatever the
+last `make build` made) on the cartridge port and `emu/sd` as the microSD
+card (videos in `emu/sd/mjpeg`, gitignored; symlinks into `test-videos/`
+work). `make emu` runs it in a window (`MACHINE=st` for the YM path). For a
+check without one:
+
+```bash
+emu/emumd/tools/mdfw run --headless --frames 1200 --no-user-config \
+    --screenshot build/out.png --log build/run.log -V --timeout 300 \
+    -- --cmd-fifo build/run.fifo
+```
+
+`-V` shows `DPRINTF` (the `HB:` heartbeat and per-50-frame decode lines
+included). Hatari makes the fifo itself; once the log says `Entering main
+loop`, `echo "hatari-event keypress 28" > build/run.fifo` presses Return on
+the first menu entry (give ESC as `0x01`: a single character is typed as
+that character). Add `--record out.avi` to get every frame and the sound;
+`ffmpeg -vf "select='not(mod(n\,100))',tile=4x4"` makes a contact sheet.
+
+How it is put together (`mdfw.ini`, `emu/`):
+- `template = sidecartridge`: the app's own `main()` runs, and EmuMD stands
+  in for `romemul.c`, `commemul.c`, `select.c`, `hw_config.c`, `sdcard.c`
+  and the Booster's first run (this app's lookup entry and settings sector,
+  since the emulated flash starts blank). The version comes from
+  `version.txt`; the UUID is the CMake default (`uuid.txt` is not committed).
+- `fb_chunked.c` is replaced by `emu/fb_chunked.c`: Core 1 jobs and their
+  arguments are 64-bit pointers on the host and cannot go through the
+  32-bit FIFO, so they wait in a slot with the FIFO as the doorbell, and the
+  transpose runs on one core. The Thumb workers in `fb_chunked_asm.S` and
+  `fb_blit_asm.S` are C in `emu/`.
+- `__MCUXPRESSO` is global here (CMake scopes it to the three JPEGDEC
+  files; nothing else reads it). The `MQ_*` flags keep their defaults —
+  add e.g. `MQ_HIST_G4=1` to `defines` to try one.
+- Firmware change for it, a no-op on the RP2040: `fb.c` does the cart
+  framebuffer's address arithmetic in `uintptr_t`. The remaining
+  pointer-to-`unsigned int` warnings (`main.c`'s debug dump, the
+  config-offset maths in `gconfig.c`/`aconfig.c`) are harmless: only the
+  low 32 bits of a difference are used.
+- What it cannot tell you: anything about time (the host is far faster, so
+  the `D` decode times mean nothing and frames never skip), memory (the RAM ceiling,
+  heap headroom and the `.uninitialized_data` hole are not modelled), races
+  between the cores, or the boot race (lesson 5). Hatari mixes the YM path
+  ~16 dB quieter than DMA sound; that is Hatari's levels, not a bug. EmuMD
+  keeps the firmware's variables across an ST reset where the RP2040 starts
+  afresh.
 
 ## Hard-won lessons (from bringing this up on hardware)
 
@@ -338,10 +391,11 @@ of the template's platform guide) was removed as an upstream duplicate.
 
 ## Editing guardrails
 
-- **Never modify** `pico-sdk/`, `pico-extras/`, `fatfs-sdk/`, `jpegdec/` —
-  submodules (the first three are re-pinned on every build). FatFs config
-  changes go in `rp/src/ff/ffconf.h`; JPEGDEC quirks are absorbed in
-  `jpegdec_core.c` / CMake, not the submodule.
+- **Never modify** `pico-sdk/`, `pico-extras/`, `fatfs-sdk/`, `jpegdec/`,
+  `emu/emumd/` — submodules (the first three are re-pinned on every build).
+  FatFs config changes go in `rp/src/ff/ffconf.h`; JPEGDEC quirks are
+  absorbed in `jpegdec_core.c` / CMake, not the submodule. For EmuMD,
+  change it upstream and update the submodule.
 - Don't add features to `main.c` — app code lives in `emul.c` + `mjpeg*`.
 - Match existing C style (`.clang-format` / `.clang-tidy` are wired into
   CMake when the binaries are on PATH).

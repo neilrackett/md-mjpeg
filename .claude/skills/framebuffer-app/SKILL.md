@@ -154,4 +154,8 @@ while (true) {
 You usually can't flash. Validate fixed-point / addressing math by
 mirroring the exact C in a small offline script and diffing against the
 reference, the way the demos were validated (e.g. interpolator configs,
-rasteriser hole-checks). Then the user flashes and confirms.
+rasteriser hole-checks). The whole app also runs in Hatari on the host
+with EmuMD (`mdfw.ini`, `emu/`; AGENTS.md's "EmuMD" section): headless runs
+give screenshots, recordings and the debug log, and a command fifo can
+drive the menu. Timing, the RAM ceiling and races still need the ST. Then
+the user flashes and confirms.
