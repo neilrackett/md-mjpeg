@@ -12,8 +12,9 @@
  * Boot block (cart bus, framebuffer, SD, SELECT) is the template's;
  * the app is mjpeg.c / mjpeg_quant.c / mjpeg_menu.c driven from the
  * main loop, a MENU <-> PLAYING state machine: the menu lists the
- * .AVI files in the app folder; Up/Down + Return picks one to play;
- * ESC backs out of a video to the menu, and quits to GEM from the
+ * .AVI files in the app folder below ABOUT and EXIT TO GEM, and reads
+ * its own keys (mjpeg_menu_key); Up/Down + Return picks a video to
+ * play; ESC backs out of a video to the menu, and quits to GEM from the
  * menu.
  */
 
@@ -115,19 +116,14 @@ void emul_start() {
   mjpeg_menu_init(sd_ok ? folderName : "/");
   cart_check("post-menu-init");
 
-  /* IKBD make scancodes. */
+  /* IKBD make scancodes for playback (the menu reads its own keys). */
   enum {
     SC_ESC = 0x01,
     SC_SPACE = 0x39,
-    SC_RETURN = 0x1C,
-    SC_UP = 0x48,
-    SC_DOWN = 0x50,
     SC_LEFT = 0x4B,
     SC_RIGHT = 0x4D,
-    SC_KP_ENTER = 0x72,
   };
   enum { STATE_MENU, STATE_PLAYING } state = STATE_MENU;
-  int sel = 0;
 
   /* --- main loop --- */
   DPRINTF("Entering main loop (%d file(s))\n", mjpeg_menu_count());
@@ -141,29 +137,13 @@ void emul_start() {
       if (!k.is_press) {
         continue;
       }
-      int n = mjpeg_menu_count();
       if (state == STATE_MENU) {
-        switch (k.scancode) {
-          case SC_UP:
-            if (n) sel = (sel + n - 1) % n;
-            break;
-          case SC_DOWN:
-            if (n) sel = (sel + 1) % n;
-            break;
-          case SC_RETURN:
-          case SC_KP_ENTER:
-            if (n) {
-              mjpeg_close();
-              if (mjpeg_open(mjpeg_menu_path(sel)) == 0) {
-                state = STATE_PLAYING;
-              }
-            }
-            break;
-          case SC_ESC:
-            ikbd_request_boot_gem(); /* quit to GEM */
-            break;
-          default:
-            break;
+        int sel = mjpeg_menu_key(k.scancode);
+        if (sel >= 0) {
+          mjpeg_close();
+          if (mjpeg_open(mjpeg_menu_path(sel)) == 0) {
+            state = STATE_PLAYING;
+          }
         }
       } else { /* STATE_PLAYING */
         switch (k.scancode) {
@@ -203,7 +183,7 @@ void emul_start() {
         state = STATE_MENU;
       }
     } else {
-      mjpeg_menu_render(sel); /* draws + publishes, VBL-paced */
+      mjpeg_menu_render(); /* draws + publishes, VBL-paced */
     }
     audio_render_frame();
     cart_check("main-loop");

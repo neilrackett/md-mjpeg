@@ -12,7 +12,7 @@ Why? Because why watch videos at 4K resolution in 16.7 million colours when you 
 
 Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut, blue-noise dither and a saturation boost, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound is 8-bit 25 kHz DMA audio on an STE, or the YM2149 (~5.6 kHz) on a plain ST — the firmware detects which machine it's on and picks the best it can do. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
 
-When it starts, the app lists the `.AVI` files in the `/mjpeg` folder of the SD card. Use **Up/Down** to choose one and **Return** to play it. During playback, **Left/Right** skip back/forward 10 seconds, **Space** pauses and resumes, and **ESC** returns to the list (a time readout pops up briefly when you seek or pause). When a video reaches the end it returns to the list too. From the list, **ESC** quits back to GEM.
+When it starts, the app lists the `.AVI` files in the `/mjpeg` folder of the SD card, below **About** and **Exit to GEM**. Use **Up/Down** to choose one and **Return** to play it. During playback, **Left/Right** skip back/forward 10 seconds, **Space** pauses and resumes, and **ESC** returns to the list (a time readout pops up briefly when you seek or pause). When a video reaches the end it returns to the list too. From the list, **Exit to GEM** (or **ESC**) quits back to GEM.
 
 ## Installation
 
@@ -68,7 +68,7 @@ EmuMD boots EmuTOS unless you give it another TOS image with `TOS=/path/to/tos.i
 - Colour systems only (ST low-res, 320×200); high-res mono screens fall back to GEM.
 - Sound is mono. An STE plays 8-bit 25 kHz DMA audio; a plain ST falls back to the YM2149 (~5.6 kHz, effectively 6-bit — think telephone, not hi-fi).
 - Very busy scenes can exceed the per-frame decode budget; the player skips frames to keep the audio smooth and the picture in sync.
-- The menu lists up to 20 files; no scrolling beyond that yet.
+- The menu lists up to 20 files.
 
 ## What's next?
 

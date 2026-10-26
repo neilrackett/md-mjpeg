@@ -36,6 +36,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
 | `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
+| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop, stall detector, cart-corruption canary |
 | `tools/video_to_avi.sh` | ffmpeg wrapper producing the AVI format contract |
