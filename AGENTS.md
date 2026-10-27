@@ -52,7 +52,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 make build     # release UF2 -> dist/<uuid>-<version>.uf2 (uuid from uuid.txt)
 make debug     # same but DEBUG_MODE=1 (UART logging on; see boot-race lesson)
 make uart-log  # attach serial console, log to ./screenlog.0
-make tag       # tag HEAD with version.txt and push (release workflow)
+make tag       # tag HEAD with version.txt and push the tag (CI tags releases itself)
 make emu       # build for the host and run in Hatari via EmuMD (see below)
 ```
 
@@ -75,6 +75,23 @@ make emu       # build for the host and run in Hatari via EmuMD (see below)
   reports traceable. `build.sh` copies it to `rp/` and `target/`, but commit
   all three (a release bumps them together; `target/atarist/version.txt` is
   separate and has stayed at `v1.0.0beta`).
+- **Every push to `main` is a release** (`.github/workflows/release.yml`, as
+  in MD/DOOM and MD/Lynx): `make` with the `APP_UUID_KEY` secret, a tag
+  named from `version.txt` (left alone if it already exists), the `latest`
+  tag moved to the commit, and the UF2 + JSON replaced on the `latest`
+  GitHub Release (its title and notes are left alone). It can also be run
+  by hand, from `main` only. `desc/app.json`'s `binary` points at
+  `downloads.neilrackett.com/md-mjpeg/<APP_UUID>.uf2`, which redirects to
+  that release's asset. So bump `version.txt` before merging anything that
+  should be a new version: a push without a bump replaces the binaries
+  under the same version.
+- `.github/workflows/pr.yml` builds pull requests to `main` and publishes
+  nothing. Both skip a change that touches nothing but documentation
+  (`**.md`) or the EmuMD build (`emu/**`, which includes the submodule, and
+  `mdfw.ini`); the two `paths-ignore` lists must match. Run the release by
+  hand to publish one of those anyway. The `Makefile` is not on the list,
+  as the release builds with it, which is why `make emu` lives in
+  `emu/emu.mk`.
 - **Dither A/B flag**: 32×32 blue noise is the default (marginally the best of the
   three tried on hardware); `MQ_DITHER=bayer ./build.sh ...` (or `make build`) builds
   the 2×2 Bayer instead. Read as an env var in `rp/src/CMakeLists.txt` →
