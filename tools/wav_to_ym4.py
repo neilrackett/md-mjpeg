@@ -342,10 +342,10 @@ def _header_guard_from_path(path: pathlib.Path) -> str:
     return f"{guard}_"
 
 
-# YMS mode tags: must stay in sync with AUDIO_YMS_MODE_* in
-# rp/src/audio.c. The RP-side audio_play_yms_file() currently only
-# accepts tag 1 (dual-ghost); other tags are reserved for future
-# m68k handler variants.
+# YMS mode tags. The template's RP-side audio_play_yms_file() accepted
+# only tag 1 (dual-ghost); other tags are reserved for future m68k
+# handler variants. (MD/MJPEG has no .YMS player: its audio refill runs
+# in an interrupt, which cannot read the SD card.)
 YMS_MODE_TAGS: dict[str, int] = {
     "dual-ghost": 1,
     "single-a":   2,
@@ -363,7 +363,7 @@ def _write_yms_file(
     mode: str,
 ) -> None:
     """Write a binary .YMS file (16-byte header + raw byte body) for
-    SD streaming via audio_play_yms_file() on the RP side. Format:
+    SD streaming (the template's audio_play_yms_file()). Format:
         off  0:  'Y' 'M' 'S' '1'        magic
         off  4:  uint32 rate_hz         LE
         off  8:  uint32 data_len_bytes  LE
@@ -459,7 +459,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yms-output", type=pathlib.Path, default=None,
                    help="Write a binary .YMS file (16-byte header + raw "
                         "byte body) to PATH, suitable for streaming from SD "
-                        "via audio_play_yms_file() on the RP side. Default: "
+                        "(the template's audio_play_yms_file()). Default: "
                         "skip. At least one of --header-output / --yms-output "
                         "must be supplied.")
     p.add_argument("--symbol", type=str, default="audio_sample_data")

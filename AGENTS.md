@@ -40,7 +40,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
 | `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
-| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish) in the frame's pens 0 and 15: pen 0 is always black, and the quantizer holds 15 at white while `mjpeg_menu_shown()` (`mq_republish()` applies it at once) (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
+| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish), and at the end of a video over its last frame (`mjpeg_finish()`: `mjpeg_menu_shown()` stays true, and `mjpeg_menu_render()` draws over the frame instead of clearing it) in the frame's pens 0 and 15: pen 0 is always black, and the quantizer holds 15 at white while `mjpeg_menu_shown()` (`mq_republish()` applies it at once) (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/fb_mono.c` | ST high res: the chunked 320×200 pens as a 640×400 one-bit picture, doubled and blue-noise dithered (see "ST high res"); shared by the hardware and EmuMD builds |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop (menu, playing, menu over the video), cart-corruption canary |
@@ -166,6 +166,7 @@ How it is put together (`mdfw.ini`, `emu/`):
   and the Booster's first run (this app's lookup entry and settings sector,
   since the emulated flash starts blank). The version comes from
   `version.txt`; the UUID is the CMake default (`uuid.txt` is not committed).
+  EmuMD's `commemul.c` provides `commemul_scan` too (the audio refill's).
 - The firmware's own `fb_chunked.c` runs, on both cores (EmuMD's core 1 is
   a host thread), so Hatari exercises the real dual-core c2p and mono
   split. Its one host-only branch is the Core 1 hand-off: a job and its
@@ -236,7 +237,7 @@ Things that cost real debugging time. Do not re-learn them.
    in `memmap_rp.ld`. **Heap headroom is load-bearing: keep ≥ 20 KB free**
    between `__bss_end__` and `0x20030000` (check the map after adding
    statics; FatFs LFN ops malloc ~0.5 KB each on top of settings). It has
-   sat just under that since the menu and colour work: **19,180 B at
+   sat just under that since the menu and colour work: **19,144 B at
    v1.1.0**, still well clear of the ~14 KB boot malloc — don't let it slide
    further.
 
@@ -261,7 +262,7 @@ Things that cost real debugging time. Do not re-learn them.
    ordinary `.bss`). Rules: contents are NOT zeroed at boot (initialize
    explicitly), and the gap contents must stay below `0x20008000` or `.bss`
    jumps 32 KB. **With only `s_jpg` in the hole the margin is comfortable
-   (~3.3 KB at v1.1.0: it ends at `0x200072C0`)** — the LUTs were pulled out to `.bss` when the menu's statics
+   (~2.8 KB at v1.1.0: it ends at `0x200074F0`)** — the LUTs were pulled out to `.bss` when the menu's statics
    tipped the then-packed hole past the boundary (jumping `.bss` a full
    32 KB and overflowing RAM); see the `.uninitialized_data` note in
    `mjpeg_quant.c`. Overflowing it is caught by the linker (`.bss will
@@ -283,7 +284,8 @@ Things that cost real debugging time. Do not re-learn them.
    ESC dead because IKBD forwarding runs inside the m68k blit loop). The
    layered diagnostics that finally worked: the UART `HB:` heartbeat (RP
    liveness, with the player counters `F` shown / `S` skipped / `I` index /
-   `E` last JPEG error / `R` ring bytes / `D` decode µs), the menu (the
+   `E` last JPEG error / `R` ring bytes / `D` decode µs / `A` audio
+   refills / `L` refill bytes), the menu (the
    version on its ABOUT row, the detected sound path on the About page —
    m68k + fb path liveness) and the cart canary (region integrity). Keep
    them. (An on-screen stall screen that painted the counters went with the
@@ -355,9 +357,10 @@ white paper (a set bit is black ink) and the palette copy is skipped. The
 cart FB is the same 32,000 bytes in the same chunk-reversed layout — 400
 rows of 80 bytes — and the same copy, but mono VBLs are 71.47 Hz (14 ms)
 and the copy takes ~17.6 ms, so **a mono frame is two VBLs**: the first
-copies `FBDRV_ITERS_A` chunks, sets `UFW_HALF` and skips the flip and the
-ack (half the FB is still unread); the next copies the rest, flips and acks
-at `$FB8400` as usual. The display is reported every VBL at `$FB9000 + mono` →
+copies `FBDRV_ITERS_A` chunks, sets `UFW_HALF`, skips the flip and reads
+`$FB8401` (`VBLSYNC_HALF_ADDR`) instead of the frame ack (half the FB is
+still unread; the audio refill keys off either); the next copies the rest,
+flips and acks at `$FB8400` as usual. The display is reported every VBL at `$FB9000 + mono` →
 `fb_st_mono()` and `audio_set_mono()`. Display rate is up to 35.7 fps, so
 25 fps video is unaffected.
 
@@ -377,10 +380,11 @@ setup out of it, or O3 inlines and unrolls it to 1.6 KB of RAM. In mono `decode_
 (`EIGHT_BIT_GRAYSCALE`, which skips the chroma IDCT and colour conversion)
 into `mq_draw_mono`, which writes 16 linear-light grey pens (Y² for the
 gamma: a mono monitor mixes light) and skips the quantizer. The time overlay
-is unchanged (pen 0 box, pen 15 text = black and white). Audio: refills
-every 14 ms, 350 DMA bytes (`userfw.s` copies 88 longwords and sets END
-from `UFW_SND_LEN`) or 79 YM pairs (Timer-B takes ~78.2 a VBL), and the
-video clock advances 350 source samples a refill (`MJPEG_SRC_PER_VBL_MONO`).
+is unchanged (pen 0 box, pen 15 text = black and white). Audio: a refill
+every VBL (14 ms), ~350 DMA bytes (the measured length starts at
+`STE_SND_LEN_INIT_MONO` and is steered only on the VBL that ends a frame)
+or 79 YM pairs (Timer-B takes ~78.2 a VBL); on the YM path the video clock
+advances 350 source samples a refill (`MJPEG_SRC_PER_VBL_MONO`).
 **Untested on an SM124**: EmuMD plays it in Hatari (`make emu MONO=1`), and
 the timing claims are md-doom's arithmetic and Hatari, not hardware.
 
@@ -391,20 +395,53 @@ VBL (224 B consumed per VBL); m68k Timer-B (~5585 Hz) plays them into the
 YM2149 volume registers; the VBL handler resets the read cursor (A0) to the
 buffer base every frame. MD/MJPEG converts u8 PCM → pairs at runtime through
 the 64-entry Ghostbusters LUT (`ghost_lut` in mjpeg.c; same table as
-`tools/wav_to_ym4.py --mode dual-ghost`). `audio_render_frame()` self-paces
-to ~50 Hz and must be called at least once per VBL — during long decodes the
-JPEGDEC draw callback calls `mjpeg_service()` (rom3 pump + ikbd + audio)
-every band, which is what keeps audio glitch-free.
+`tools/wav_to_ym4.py --mode dual-ghost`).
 
 On an STE the firmware instead uses **DMA sound** (25 kHz, 8-bit signed): the
 RP passes the AVI's PCM through unchanged and `userfw.s` plays it from a
-double buffer in the two screen-page tails (`$77D00`/`$7FD00`), swapping on
-the DMA frame counter so the m68k write never crosses the read pointer. The
-path is auto-detected at boot (`_SND` cookie, reported to the RP each VBL via
-`fb_rom3_dispatch` → `audio_set_mode`); on a plain ST the same 25 kHz stream
-is box-averaged down for the YM callback. Full detail in the DMA-sound memory
-note; both paths consume 500 source samples/VBL so A/V pacing is identical
-(350 at mono's 71 Hz; see "ST high res" above).
+double buffer in the two screen-page tails (`$77D00`/`$7FD00`), copying into
+the one the chip isn't playing. The path is auto-detected at boot (`_SND`
+cookie, reported to the RP each VBL via `fb_rom3_dispatch` →
+`audio_set_mode`); on a plain ST the same 25 kHz stream is box-averaged down
+for the YM callback (500 source samples a VBL, 350 at mono's 71 Hz).
+
+**Ported from MD/DOOM in v1.1.0, all three found on hardware** — on a Mega
+STE here, sound for a few seconds, then silence for 2:49, noise bursts and
+buzzes:
+- **The DMA's START/END are re-pointed from a Timer-A interrupt**
+  (`userfw_snd_irq`, event-count mode: the chip's frame end is Timer-A's
+  input), never from the VBL loop. The chip latches them at each frame end
+  and the six byte writes aren't atomic; from the VBL loop, a frame end
+  drifting into that window latched one buffer's START with the other's
+  END — 32 KB of screen memory as ~1.3 s of noise, or START past END and
+  the chip running round the whole 4 MB DMA address space (167 s at
+  25,033 Hz: the 2:49). The MFP is in auto-EOI mode on both sound paths,
+  as the handler has no in-service ack.
+- **The DMA length is measured.** The chip eats ~501.5 samples a VBL (its
+  own oscillator, not the video's), so a fixed 500 ran a buffer dry and
+  replayed it every few seconds. `.after_copy` steers `UFW_SND_LEN` ±1
+  every fourth frame from how the frame counter's offset drifts, and
+  reports it each VBL at `$FB8C00 + len - 320` → `audio_sndlen_report()`;
+  the fill produces exactly that many samples and the video clock advances
+  by them, so A/V follows the sound actually played.
+- **The RP refills from a 1 ms timer on Core 1** (`audio_start_vbl_timer`,
+  an alarm pool created on Core 1), which peeks at the ROM3 ring
+  (`commemul_scan`, not consuming it) for the m68k's `$84xx` ack and fills
+  right after it — a whole VBL before the m68k copies again, however busy
+  Core 0 is (decoding, or waiting in `fb_publish`). The old main-loop refill
+  paced itself off the RP's clock, so it slipped against the VBL. The fill
+  callback runs in that interrupt under `audio_lock()`, so the player takes
+  the lock to reset its PCM ring or clock (open, close, seek), the ring
+  indices are volatile, and it must never touch the SD card (the
+  template's `.YMS` streamer went for that reason). MD/DOOM measured the
+  same timer on Core 0 stalling compute for 100–200 ms at a time — keep it
+  on Core 1.
+
+The heartbeat's `A` (refills since the last line: ~150, ~214 in mono) and
+`L` (the refill size, i.e. the DMA length it settled on) show it working.
+On the YM path the refill lands while Timer-B is near the end of the
+buffer, so the last few samples of a VBL come from the next one (MD/DOOM
+has the same, as a known issue).
 
 ### Shared 64 KB cartridge region (`$FA0000` ↔ RP `0x20030000`)
 
@@ -429,8 +466,10 @@ The m68k cannot write the region, so it talks to the RP by **reading** ROM3
 | Read | Meaning |
 | --- | --- |
 | `$FB8200 + byte` | IKBD byte (`ikbd.c`) |
-| `$FB8400` | frame ack: the copy is done, the cart FB may be rewritten (in mono only on the VBL that ends a frame) |
+| `$FB8400` | frame ack: the copy is done, the cart FB may be rewritten (in mono only on the VBL that ends a frame); refills the audio |
+| `$FB8401` | mono, the VBL after a frame's first half: refills the audio, but not a frame ack |
 | `$FB8600 + dma` | sound path, every VBL (0 YM, 1 STE DMA) |
+| `$FB8C00 + len - 320` | STE DMA sound: the bytes the chip eats per VBL, as measured (every VBL) |
 | `$FB9000 + mono` | display, every VBL (1 = ST high res) |
 
 Odd low bytes do reach the RP: the IKBD window and the `+ 1` reports depend
@@ -482,7 +521,9 @@ of the template's platform guide) was removed as an upstream duplicate.
 | Screen frozen on boot pattern, default colours | RP died/panicked before `mq_init` (palette never changed) or m68k died — check UART heartbeat to tell them apart |
 | `E<n>` non-zero in the `HB:` heartbeat | Decoder erroring; `E` = JPEGDEC error code |
 | Video races ahead / skips at 2-4× speed, sound too fast | A 5,600 Hz AVI (the encoder's default): see Known issues — encode with `STE=1` |
-| Mono: tearing or half-old frames | The VBL after the first half must not ack — `$FB8400` only once the whole frame is copied (`UFW_HALF` in `userfw.s`) |
+| Mono: tearing or half-old frames | The VBL after the first half must not ack — `$FB8400` only once the whole frame is copied (`UFW_HALF` in `userfw.s`; that VBL reads `$FB8401`, which `fb.c` must not count) |
+| STE DMA: sound stops for ~2:48 then returns, or ~1 s bursts of noise | The DMA's START/END written outside `userfw_snd_irq` (see "Audio pipeline") |
+| STE DMA: a crackle every few seconds | The DMA length not steered, or the RP not producing `L` bytes; check `L` in the heartbeat moves off 500 |
 | Audio crackle/dropouts every ~0.5 s | PCM ring underrun — check `R` in heartbeat, see lesson 8 |
 | Choppy video, many skips | Decode over 40 ms/frame — re-encode at higher `-q` (speed dial), see encoding contract |
 | `the input device is not a TTY` from stcmd | Export `STCMD_NO_TTY=1` (build scripts already do) |
@@ -508,17 +549,23 @@ of the template's platform guide) was removed as an upstream duplicate.
 ## Editing guardrails
 
 - **Never modify** `pico-sdk/`, `pico-extras/`, `fatfs-sdk/`, `jpegdec/`,
-  `emu/emumd/` — submodules (the first three are re-pinned on every build).
-  FatFs config changes go in `rp/src/ff/ffconf.h`; JPEGDEC quirks are
-  absorbed in `jpegdec_core.c` / CMake, not the submodule. For EmuMD,
-  change it upstream and update the submodule.
+  `emu/emumd/` — submodules, all re-pinned on every build (`rp/build.sh`
+  runs `git submodule update --init --recursive`, which checks each out
+  at the commit in the index). FatFs config changes go in
+  `rp/src/ff/ffconf.h`; JPEGDEC quirks are absorbed in `jpegdec_core.c` /
+  CMake, not the submodule. For EmuMD, change it upstream and update the
+  submodule: check out the new commit in `emu/emumd` and `git add
+  emu/emumd` before the next `make build`, or the build puts it back.
+  Then delete any glue in `emu/` that the newer EmuMD provides (its
+  `docs/GUIDE.md` lists them; the link fails with a duplicate symbol
+  until you do).
 - Don't add features to `main.c` — app code lives in `emul.c` + `mjpeg*`.
 - Match existing C style (`.clang-format` / `.clang-tidy` are wired into
   CMake when the binaries are on PATH).
 - New/modified source files get the SPDX header:
   `Copyright (C) 2026 Neil Rackett` / `SPDX-License-Identifier: GPL-3.0-or-later`.
 - After any change that adds statics, check the map: `__bss_end__` headroom
-  vs `0x20030000` (≥ 20 KB target; 19,180 B at v1.1.0, see lesson 2) and that
+  vs `0x20030000` (≥ 20 KB target; 19,144 B at v1.1.0, see lesson 2) and that
   `.uninitialized_data` still ends below `0x20008000`.
 - **No AI attribution anywhere** — no `Co-Authored-By: Claude`, no
   "Generated with…" in commits, PRs, comments, docs or changelogs. Write as

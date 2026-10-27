@@ -83,6 +83,25 @@ int commemul_init(void) {
   return 0;
 }
 
+bool __not_in_flash_func(commemul_scan)(uint32_t *cursor, uint16_t window_hi) {
+  if (!commInitialized) {
+    return false;
+  }
+  uint32_t transfersWritten =
+      COMM_DMA_TRANSFER_COUNT - dma_hw->ch[commDmaChannel].transfer_count;
+  uint32_t writeIdx = transfersWritten & COMM_RING_MASK;
+  uint32_t idx = *cursor & COMM_RING_MASK;
+  bool seen = false;
+  while (idx != writeIdx) {
+    if ((commRing[idx] & 0xFF00u) == window_hi) {
+      seen = true;
+    }
+    idx = (idx + 1u) & COMM_RING_MASK;
+  }
+  *cursor = writeIdx;
+  return seen;
+}
+
 void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {
   if ((!commInitialized) || (callback == NULL)) {
     return;

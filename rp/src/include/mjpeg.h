@@ -48,6 +48,12 @@ int mjpeg_open(const char *path);
  * (mjpeg_open refuses while one is already open). */
 void mjpeg_close(void);
 
+/* At the end of a video: mjpeg_close(), but leave its last frame on
+ * screen with the menu over it -- mjpeg_menu_shown() stays true until
+ * the next mjpeg_close(), and mjpeg_menu_render() draws over the frame
+ * instead of clearing it. */
+void mjpeg_finish(void);
+
 /* Advance the player: buffer audio chunks, and decode+publish (or
  * skip) at most one video frame. Call once per main-loop iteration.
  * Returns quickly when no frame is due. Returns true while the movie
@@ -57,9 +63,10 @@ void mjpeg_close(void);
 bool mjpeg_tick(void);
 
 /* Keep the platform alive during long operations: drains the ROM3
- * ring (IKBD + VBL sync) and refills the cart audio buffer. Called
- * from the JPEG draw callback every few MCU rows so audio never
- * underruns during a ~30 ms decode. Safe to call at any time. */
+ * ring (IKBD + VBL sync and the m68k's reports). Called from the JPEG
+ * draw callback every few MCU rows, so keys and acks are seen during a
+ * ~50 ms decode. (The audio refills itself, from an interrupt on Core
+ * 1.) Safe to call at any time. */
 void mjpeg_service(void);
 
 /* --- playback controls ------------------------------------------- */
@@ -82,7 +89,8 @@ void mjpeg_render_paused(void);
 /* Draw the menu (mjpeg_menu_draw_over) over every frame from now on, or
  * stop. The video carries on underneath, paused or playing; closing it
  * over a paused video redraws the frozen frame without it. No-op with no
- * video open; mjpeg_close() clears it. */
+ * video open; mjpeg_close() clears it. mjpeg_menu_shown() is also true
+ * after mjpeg_finish(), over the last frame of a video that has ended. */
 void mjpeg_show_menu(bool on);
 bool mjpeg_menu_shown(void);
 

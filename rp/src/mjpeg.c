@@ -133,8 +133,11 @@ static uint32_t s_frame_offsets[SEEK_RING]; /* frame index -> file offset */
 static uint32_t s_frames_shown, s_frames_skipped;
 static uint32_t s_decode_us; /* last decode cost, for the stats line */
 
+/* PCM ring: Core 0 (the demuxer) pushes, the fill callback pops on Core
+ * 1 (audio.c's refill interrupt). Single producer, single consumer;
+ * resetting it takes audio_lock(). */
 static uint8_t aring[ARING_SIZE];
-static uint32_t aring_head, aring_tail; /* free-running; head - tail = fill */
+static volatile uint32_t aring_head, aring_tail; /* free-running; head - tail = fill */
 
 /* JPEGDEC state is ~18 KB. Placed in .uninitialized_data, which lands
  * in the otherwise-dead gap between .data and the 32 KB-aligned
@@ -150,11 +153,10 @@ static uint32_t s_jpg_base; /* file offset of the JPEG being decoded */
 
 static inline uint32_t aring_level(void) { return aring_head - aring_tail; }
 
-/* Source PCM samples consumed per VBL = the 25 kHz source rate / 50 Hz
- * VBL. Both back-ends consume this many source samples (DMA 1:1, YM
- * downsampled), so video pacing (s_sample_clock) is identical either
- * way and A/V stays locked regardless of which path is active. In ST
- * high res a VBL is 71.47 Hz, so 350 (audio.c's DMA refill matches). */
+/* Source PCM samples one VBL of YM output takes = the 25 kHz source rate
+ * / 50 Hz VBL; in ST high res a VBL is 71.47 Hz, so 350. The DMA path
+ * takes what the m68k measures the chip eating instead (~501.5, or ~350
+ * in mono), so the video clock follows the sound actually played. */
 #define MJPEG_SRC_PER_VBL 500u
 #define MJPEG_SRC_PER_VBL_MONO 350u
 
@@ -168,30 +170,34 @@ static inline uint8_t aring_pop(void) {
   return s;
 }
 
-/* Per-VBL fill callback (audio.c). Produces the format matching the
- * runtime audio mode, then advances the sample clock by one VBL of
- * source samples (silence counts as time, so video keeps pacing
- * before the first audio and across underruns):
- *  - DMA: signed-PCM passthrough. AVI stores unsigned (silence 0x80),
- *    the DMA wants signed (silence 0x00) -> flip the top bit.
+/* Per-VBL fill callback (audio.c's refill interrupt, on Core 1 under
+ * audio_lock()). Produces the format matching the runtime audio mode,
+ * then advances the sample clock by one VBL of source samples (silence
+ * counts as time, so video keeps pacing before the first audio and
+ * across underruns):
+ *  - DMA: signed-PCM passthrough, `bytes` samples (the chip's measured
+ *    VBL). AVI stores unsigned (silence 0x80), the DMA wants signed
+ *    (silence 0x00) -> flip the top bit.
  *  - YM: box-average one VBL of source samples down to bytes/2
  *    outputs (~4.46:1 for a 25 kHz source on a plain ST), each mapped
  *    through the Ghostbusters (vA,vB) LUT.
  *  - SILENT (pre-report): zeros. */
 static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
-  if (s_paused) {
-    /* Silence, and DON'T advance the clock or drain the ring, so the
-     * picture and audio both resume exactly where they froze. Zero is
-     * silence for both back-ends (signed 0x00 for DMA, volume 0 YM). */
+  if (!s_open || s_paused) {
+    /* Nothing playing (or still priming), or paused: silence, and DON'T
+     * advance the clock or drain the ring, so the picture and audio both
+     * resume exactly where they froze. Zero is silence for both
+     * back-ends (signed 0x00 for DMA, volume 0 YM). */
     memset(buf, 0, bytes);
     return;
   }
-  const uint32_t src = fb_st_mono() ? MJPEG_SRC_PER_VBL_MONO : MJPEG_SRC_PER_VBL;
+  uint32_t src = fb_st_mono() ? MJPEG_SRC_PER_VBL_MONO : MJPEG_SRC_PER_VBL;
   switch (audio_get_mode()) {
     case AUDIO_MODE_DMA:
       for (uint32_t i = 0; i < bytes; i++) {
         *buf++ = (uint8_t)(aring_pop() ^ 0x80u);
       }
+      src = bytes;
       break;
     case AUDIO_MODE_YM: {
       uint32_t outs = bytes / 2u;
@@ -232,6 +238,7 @@ static uint32_t aring_push_file(uint32_t bytes) {
     if (!lin) break;
     UINT n = 0;
     if (f_read(&s_fil, &aring[head], lin, &n) != FR_OK || n == 0) break;
+    __sync_synchronize(); /* the bytes land before Core 1 can see them */
     aring_head += n;
     pushed += n;
     bytes -= n;
@@ -468,16 +475,19 @@ static void decode_at(uint32_t p) {
 void mjpeg_service(void) {
   fb_pump_rom3();
   ikbd_pump();
-  audio_render_frame();
 }
 
 uint32_t mjpeg_frames_shown(void) { return s_frames_shown; }
 
 void mjpeg_debug_status(char *buf, int len) {
-  snprintf(buf, (size_t)len, "F%lu S%lu I%lu E%d R%lu D%luus",
+  /* A: audio refills since the last line (~150 in 3 s, ~214 in mono);
+   * L: their size, the DMA length the m68k has settled on. */
+  snprintf(buf, (size_t)len, "F%lu S%lu I%lu E%d R%lu D%luus A%lu L%lu",
            (unsigned long)s_frames_shown, (unsigned long)s_frames_skipped,
            (unsigned long)s_frame_index, s_jpg.iError,
-           (unsigned long)aring_level(), (unsigned long)s_decode_us);
+           (unsigned long)aring_level(), (unsigned long)s_decode_us,
+           (unsigned long)audio_take_fills(),
+           (unsigned long)audio_get_fill_bytes());
 }
 
 int mjpeg_open(const char *path) {
@@ -506,20 +516,36 @@ int mjpeg_open(const char *path) {
   prefill_audio();
   DPRINTF("MJPEG: primed %lu B of audio\n", (unsigned long)aring_level());
   audio_set_fill_callback(mjpeg_audio_fill);
-  s_open = true;
+  const uint32_t saved = audio_lock();
+  s_open = true; /* the fill starts taking from the primed ring */
+  audio_unlock(saved);
   DPRINTF("MJPEG: playing %s\n", path);
   return 0;
 }
 
 void mjpeg_close(void) {
-  if (s_open) {
+  /* Stop the fill (silence from its next refill) and drain the ring. */
+  const uint32_t saved = audio_lock();
+  const bool was_open = s_open;
+  s_open = false;
+  aring_head = aring_tail = 0;
+  audio_unlock(saved);
+  s_menu = false;
+  if (was_open) {
     f_close(&s_fil);
-    s_open = false;
-    s_menu = false;
     DPRINTF("MJPEG: closed\n");
   }
-  /* Drain the ring so the fill callback emits silence in the menu. */
-  aring_head = aring_tail = 0;
+}
+
+void mjpeg_finish(void) {
+  mjpeg_close();
+  /* The last frame stays in the chunked buffer and its palette in the
+   * quantizer, so the menu can go straight over it, as over a playing
+   * video (pen 15 held white). Nothing shown, nothing to keep. */
+  if (s_frames_shown) {
+    s_menu = true;
+    mq_republish();
+  }
 }
 
 bool mjpeg_tick(void) {
@@ -599,8 +625,10 @@ bool mjpeg_tick(void) {
 static void seek_resync_audio(void) {
   s_audio_left = 0;
   s_audio_skip = 0;
+  const uint32_t saved = audio_lock();
   aring_head = aring_tail = 0;
   s_sample_clock = (uint32_t)((uint64_t)s_frame_index * s_samples_per_frame);
+  audio_unlock(saved);
 }
 
 void mjpeg_seek(int seconds) {

@@ -34,8 +34,9 @@
 ; IRQ ownership: TOS's HBL ($68), Timer-A/B/C/D
 ; ($134/$120/$114/$110), and ACIA ($118) handlers are stubbed to
 ; single-rte dummies and their MFP IERA/IERB bits are cleared so no
-; MFP source can fire. Only the custom VBL handler at $70 stays
-; active.
+; MFP source can fire. Then the sound path claims one timer: Timer-B
+; for the YM, or Timer-A for STE DMA sound (userfw_snd_irq, one event
+; per DMA frame end). Plus the custom VBL handler at $70.
 ;
 ; IKBD bytes are forwarded inline from FBDRV_INLINE. The MOVEM-burst
 ; framebuffer copy emits an IKBD poll block every FBDRV_IKBD_POLL_EVERY
@@ -95,17 +96,18 @@ UFW_VBL_FLAG          equ $4C6               ; word: cleared by userfw_vbl, poll
 ; Used by FBDRV_INLINE to spill A7 (SP) around the MOVEM-burst that
 ; includes A7 in its register list; the current-page pointer
 ; UFW_SCREEN_PAGE and the saved TOS VBL vector / Physbase result
-; also live here. 16 bytes used; SCREEN_A's tail at $77D00 has 768
-; bytes available (shifter only reads 200*160 = 32000 B of each
-; screen page, allocation is 32 KB).
+; also live here, from $77FE0. SCREEN_A's tail at $77D00 has 768
+; bytes (shifter only reads 200*160 = 32000 B of each screen page,
+; allocation is 32 KB); the DMA sound buffer takes $77D00..$77EFF.
 UFW_VBL_VEC_SAVE      equ $00077FE0          ; longword: TOS VBL vector ($70)
 UFW_HAS_DMA           equ $00077FE4          ; byte: 1 = STE DMA sound detected
 UFW_PHYSBASE_SAVE     equ $00077FE8          ; longword: XBIOS Physbase result
 UFW_SCREEN_PAGE       equ $00077FEC          ; longword: current draw page address
 UFW_MONO              equ $00077FF0          ; byte: 1 = ST high res (mono monitor)
 UFW_HALF              equ $00077FF1          ; byte: $FF = mono frame half copied, rest next VBL
-UFW_SND_LEN           equ $00077FF2          ; word: DMA bytes per VBL (STE_SND_BYTES or _MONO)
-UFW_SND_COPY          equ $00077FF4          ; word: longwords copied per VBL, minus 1 (dbf)
+UFW_SND_LEN           equ $00077FF2          ; word: current DMA buffer length in bytes
+UFW_SND_PREVPOS       equ $00077FF4          ; word: DMA offset within its buffer, last VBL
+UFW_SND_TICK          equ $00077FF6          ; byte: frame counter, steer on every 4th
 
 ; fbdrv iteration arithmetic. Pulled out as equs so the macro body
 ; below doesn't carry literal magic numbers. FBDRV_TOTAL_BYTES is
@@ -302,19 +304,56 @@ STE_DMA_END_LO        equ $FFFF8913
 STE_DMA_MODE          equ $FFFF8921          ; bit7 = mono, bits1-0 = rate
 STE_DMA_MODE_VAL      equ $82                ; mono + 25033 Hz (rate = 2)
 STE_DMA_CNT_MID       equ $FFFF890B          ; frame COUNTER mid byte (read-only)
+STE_DMA_CNT_LO        equ $FFFF890D          ; frame COUNTER low byte (read-only)
 ; Double buffer in the two screen-page tails. Loop-mode DMA plays one
 ; while .after_copy refills the OTHER, so the m68k write never crosses
 ; the DMA read pointer (the single-buffer version tore one sample per
 ; VBL -> constant ~50 Hz buzz). Which buffer the DMA is in is read from
 ; bit 7 of the frame-counter mid byte: A ($77Dxx, mid $7D/$7E -> bit7=0)
 ; vs B ($7FDxx, mid $FD/$FE -> bit7=1).
+;
+; START/END are written by userfw_snd_irq, not by the VBL loop. The
+; chip latches them only when it reaches END, and the frame end pulses
+; MFP Timer-A's event input, so the handler runs the moment the chip
+; has switched buffers and points START/END at the one it just left --
+; a full frame before the next latch. Written from the VBL loop after
+; the copy, the six byte writes sat at an arbitrary phase of the DMA
+; frame, and whenever the chip's slow drift brought its frame end into
+; that window it latched a START from one buffer and an END from the
+; other. Going from A to B that played the 32 KB of screen memory
+; between them (~1.3 s of noise); going from B to A it left START past
+; END, and the chip ran on through the whole 4 MB DMA address space
+; (2 min 48 s of silence, near enough) before it came round to END.
+; Both were heard on a Mega STE; MD/DOOM found and fixed the first.
 STE_SND_BUF_A         equ $00077D00          ; page A tail
 STE_SND_BUF_B         equ $0007FD00          ; page B tail
-STE_SND_BYTES         equ 500                ; ~1 PAL VBL @ 25033 Hz (mult of 4)
-; Mono VBLs come at 71.47 Hz, so one is ~350 samples. Copied as 88
-; longwords (352 bytes, the last two never played); END is set from the
-; length, which only has to be even.
-STE_SND_BYTES_MONO    equ 350
+STE_SND_BUF_MASK      equ $7D00              ; low 16 bits of either base, bit 15 cleared
+
+; The DMA plays 25,033 samples a second off its own oscillator; the VBL
+; comes from a different one. So the samples the chip eats per VBL is
+; not 500, not an integer, and not the same on every machine -- it is
+; around 501.5. Handing it a fixed 500 every VBL runs the buffer dry
+; every few hundred frames and replays one, a crackle every few seconds.
+;
+; So the length is measured: UFW_SND_LEN is steered by .after_copy until
+; the chip consumes exactly one buffer per frame, whatever the true
+; ratio is on this machine, and sent to the RP through
+; SNDLEN_WINDOW_BASE so it produces exactly that many samples. (From
+; MD/DOOM, where it was worked out on hardware.)
+;
+; The copy is a fixed STE_SND_COPY bytes so the longword loop stays
+; simple; anything past UFW_SND_LEN sits in the buffer unplayed, because
+; END is set from the length rather than the copy size. END is a byte
+; address, so the length need not be a multiple of anything.
+;
+; Mono VBLs come at 71.47 Hz, so the chip eats about 350 bytes a VBL
+; there: the same steering, from a different starting guess. The minimum
+; covers both and keeps the report inside one byte (512 - 320 = 192).
+STE_SND_COPY          equ 512                ; bytes copied per VBL (mult of 4)
+STE_SND_LEN_INIT      equ 500                ; starting guess, steered from here
+STE_SND_LEN_INIT_MONO equ 350                ; the same at 71 Hz
+STE_SND_LEN_MIN       equ 320
+STE_SND_LEN_MAX       equ 512                ; must not exceed STE_SND_COPY
 
 ; Cookie jar (_p_cookies) + _SND cookie for DMA-sound detection.
 COOKIE_JAR_PTR        equ $000005A0          ; longword: cookie jar base (0 = none)
@@ -325,6 +364,12 @@ COOKIE_SND            equ $5F534E44          ; '_SND'; value bit 1 = DMA/PCM sou
 ; produces the matching audio format. Distinct from IKBD ($FB8200)
 ; and VBLSYNC ($FB8400).
 SNDCAP_WINDOW_BASE    equ $FB8600
+
+; Buffer-length report: the m68k reads (SNDLEN_WINDOW_BASE + len -
+; STE_SND_LEN_MIN) once per VBL while STE DMA sound is running, so the
+; RP produces exactly the number of samples the chip is about to eat.
+; The bias keeps the whole range inside one byte.
+SNDLEN_WINDOW_BASE    equ $FB8C00
 
 ; FORCE_NO_DMA=1 (build flag) forces detection to report "no DMA" so
 ; the YM/downsample fallback can be exercised on an STE without a
@@ -355,6 +400,8 @@ MFP_IMRA              equ $FFFFFA13          ; interrupt mask A
 MFP_IMRB              equ $FFFFFA15          ; interrupt mask B
 MFP_VR                equ $FFFFFA17          ; vector register (high nibble = vector base, bit 3 = S: 1=software EOI, 0=auto-EOI)
 MFP_TACR              equ $FFFFFA19          ; Timer-A control register (cleared at boot for safety)
+MFP_TADR              equ $FFFFFA1F          ; Timer-A data register
+MFP_TIMERA_BIT        equ 5                  ; IERA/IMRA bit for Timer-A
 MFP_TBCR              equ $FFFFFA1B          ; Timer-B control register (delay-mode + prescaler)
 MFP_TBDR              equ $FFFFFA21          ; Timer-B data register (8-bit countdown)
 
@@ -398,6 +445,11 @@ IKBD_WINDOW_BASE      equ $FB8200
 ; IKBD window ($82) so the RP can tell the two apart. The value read
 ; is irrelevant; only the address matters.
 VBLSYNC_ADDR          equ $FB8400
+; The VBL after the first half of a mono frame reads this instead: "a
+; VBL went by" without "the cart FB is free". The RP refills the audio
+; on either (the m68k copies a buffer every VBL), but takes only
+; VBLSYNC_ADDR as a frame ack.
+VBLSYNC_HALF_ADDR     equ (VBLSYNC_ADDR + 1)
 
 ; Display report: the m68k reads (VIDEO_WINDOW_BASE + UFW_MONO) once per
 ; VBL, so the RP knows which picture to draw and how much audio a 71 Hz
@@ -443,16 +495,12 @@ userfw:
     ; 71 Hz there, so the DMA takes ~350 bytes of sound per VBL, not 500.
     clr.b   UFW_MONO
     clr.b   UFW_HALF
-    move.w  #STE_SND_BYTES, UFW_SND_LEN
-    move.w  #(STE_SND_BYTES/4)-1, UFW_SND_COPY
     move.b  SHIFTER_RES.w, d0
     andi.b  #3, d0
     cmpi.b  #SHIFTER_RES_HIGH, d0
     bne.s   .res_colour
     move.b  #1, UFW_MONO
     move.w  #MONO_PAPER_WHITE, PALETTE_BASE.w
-    move.w  #STE_SND_BYTES_MONO, UFW_SND_LEN
-    move.w  #((STE_SND_BYTES_MONO+3)/4)-1, UFW_SND_COPY
 .res_colour:
 
     ; --- Detect STE DMA sound via the _SND cookie (bit 1) ---------
@@ -546,6 +594,17 @@ userfw:
     clr.b   MFP_IMRA.w
     clr.b   MFP_IMRB.w
 
+    ; Flip the MFP Vector Register to AUTO-EOI mode (clear the S bit,
+    ; VR bit 3) for BOTH audio paths. With S=0 the MFP clears its own
+    ; in-service bit on each IACK cycle, so neither Timer-B (YM) nor
+    ; Timer-A (DMA, userfw_snd_irq) writes an in-service ack -- without
+    ; it, the first Timer-A fire would block every one after it. For
+    ; Timer-B it also saves ~12 cyc per IRQ * ~125 IRQ/VBL = ~1500
+    ; cyc/VBL.
+    move.b  28(a5), d0                    ; copy TOS's VR (saved above)
+    andi.b  #$F7, d0                      ; clear bit 3 (S) -> auto-EOI
+    move.b  d0, MFP_VR.w
+
     ; Audio back-end chosen at runtime from UFW_HAS_DMA (detected
     ; above). Both the YM/Timer-B and STE DMA paths are compiled in.
     tst.b   UFW_HAS_DMA
@@ -585,18 +644,10 @@ userfw:
     ; the countdown. Enable + unmask Timer-B at the MFP. SR is
     ; still IPL=7 at this point (set by `ori.w #$0700, sr` at the
     ; very top of userfw), so no IRQ fires until SR is dropped to
-    ; $2300 below.
-    ;
-    ; Also flip the MFP Vector Register to AUTO-EOI mode (clear
-    ; the S bit, VR bit 3). With S=0 the MFP clears its own in-
-    ; service bit on each IACK cycle, so the Timer-B handler can
-    ; skip the explicit `move.b #$FE, MFP_ISRA.w` ACK -- saves
-    ; ~12 cyc per IRQ * ~125 IRQ/VBL = ~1500 cyc/VBL.
+    ; $2300 below. The MFP is in auto-EOI mode (set above), so the
+    ; handler has no in-service ack.
     lea     userfw_timerb_audio(pc), a0
     move.l  a0, VEC_TIMERB.w
-    move.b  28(a5), d0                    ; copy TOS's VR (saved above)
-    andi.b  #$F7, d0                      ; clear bit 3 (S) -> auto-EOI
-    move.b  d0, MFP_VR.w
     move.b  #TIMERB_COUNT, MFP_TBDR.w
     move.b  #TIMERB_PRESCALER, MFP_TBCR.w
 
@@ -615,23 +666,31 @@ userfw:
     ; --- STE DMA sound init: mono 25033 Hz, loop mode, double-buffered.
     ; Silence both buffers, program start/end to buffer A, start the
     ; loop. The DMA free-runs; .after_copy refills whichever buffer the
-    ; DMA isn't reading and points the loop at it. No Timer-B, no YM.
+    ; DMA isn't reading, and userfw_snd_irq points the loop at it. No
+    ; Timer-B, no YM.
     lea     STE_SND_BUF_A, a0
-    move.w  #(STE_SND_BYTES/4)-1, d0
+    move.w  #(STE_SND_COPY/4)-1, d0
 .ste_snd_clr_a:
     clr.l   (a0)+
     dbf     d0, .ste_snd_clr_a
     lea     STE_SND_BUF_B, a0
-    move.w  #(STE_SND_BYTES/4)-1, d0
+    move.w  #(STE_SND_COPY/4)-1, d0
 .ste_snd_clr_b:
     clr.l   (a0)+
     dbf     d0, .ste_snd_clr_b
+    move.w  #STE_SND_LEN_INIT, UFW_SND_LEN
+    tst.b   UFW_MONO
+    beq.s   .ste_snd_len_set
+    move.w  #STE_SND_LEN_INIT_MONO, UFW_SND_LEN
+.ste_snd_len_set:
+    clr.w   UFW_SND_PREVPOS
+    clr.b   UFW_SND_TICK
     move.b  #STE_DMA_MODE_VAL, STE_DMA_MODE.w
     move.b  #((STE_SND_BUF_A>>16)&$FF), STE_DMA_START_HI.w
     move.b  #((STE_SND_BUF_A>>8)&$FF), STE_DMA_START_MID.w
     move.b  #(STE_SND_BUF_A&$FF), STE_DMA_START_LO.w
-    ; END = buffer A + this mode's length (the buffer stays inside one
-    ; 64 KB bank, so only the low word moves).
+    ; END = buffer A + the starting length, as userfw_snd_irq computes it
+    ; (the buffer stays inside one 64 KB bank, so only the low word moves).
     move.l  #STE_SND_BUF_A, d0
     add.w   UFW_SND_LEN, d0
     move.b  #((STE_SND_BUF_A>>16)&$FF), STE_DMA_END_HI.w
@@ -639,6 +698,17 @@ userfw:
     lsr.w   #8, d1
     move.b  d1, STE_DMA_END_MID.w
     move.b  d0, STE_DMA_END_LO.w
+    ; Timer-A in event-count mode, one event per DMA frame end, so
+    ; userfw_snd_irq re-points START/END right after every buffer switch
+    ; (see the handler). Vector, data, control, then enable + unmask;
+    ; interrupts are still masked here, so nothing fires until the
+    ; caller's level is restored below.
+    lea     userfw_snd_irq(pc), a0
+    move.l  a0, VEC_TIMERA.w
+    move.b  #1, MFP_TADR.w                ; interrupt on every event
+    move.b  #$08, MFP_TACR.w              ; event-count mode
+    bset    #MFP_TIMERA_BIT, MFP_IERA.w
+    bset    #MFP_TIMERA_BIT, MFP_IMRA.w
     move.b  #$03, STE_DMA_CTRL.w          ; play + loop
 
 .boot_audio_done:
@@ -659,8 +729,9 @@ userfw:
     ; Pin IRQ state for the duration of .vbl_loop:
     ;   SR = $2300: supervisor mode, IPL=3. Blocks levels 1-3 (HBL
     ;   at IPL 2), allows VBL at IPL 4 and MFP at IPL 6. The only
-    ;   MFP source enabled is Timer-B (IERA/IMRA bit 0), so the
-    ;   m68k sees VBL + Timer-B IRQs.
+    ;   MFP source enabled is Timer-B (IERA/IMRA bit 0) on the YM path
+    ;   or Timer-A (bit 5) on the DMA path, so the m68k sees VBL + that
+    ;   timer's IRQs.
     move.w  #$2300, sr
 
     ; --- Per-VBL loop ---
@@ -769,50 +840,110 @@ userfw:
     tst.b   (a1, d1.w)
 
     ; When DMA sound is active, refill the buffer the DMA is NOT reading
-    ; (double-buffer) and point the loop at it, so the write never
-    ; crosses the DMA read pointer. Bit 7 of the frame-counter mid byte
-    ; tells us the current buffer: 0 = A -> refill B; 1 = B -> refill A.
-    ; D1/D2/D3/A1/A2 are scratch (clobbered by FBDRV_INLINE; the
-    ; page-flip below uses A5/D0). ~125 longwords from the cart, ~0.3 ms
-    ; (88 in mono, where UFW_SND_LEN is a 71 Hz VBL's worth).
+    ; (double-buffer), so the write never crosses the DMA read pointer.
+    ; userfw_snd_irq has already pointed the loop at it. D1/D2/D3/A1/A2
+    ; are scratch (clobbered by FBDRV_INLINE; the page-flip below uses
+    ; A5/D0). 128 longwords from the cart, ~0.5 ms.
     tst.b   UFW_HAS_DMA
-    beq.s   .no_dma_refill
-    btst    #7, STE_DMA_CNT_MID.w
+    beq     .no_dma_refill
+
+    ; Where is the chip, and which buffer is it in? Both come out of one
+    ; pair of counter reads, so the length decision and the buffer
+    ; choice below can never disagree about what it is playing. Bit 15
+    ; of the address separates the two buffers ($x7D00 vs $xFD00), so
+    ; masking it off leaves the offset within whichever one it is in.
+    moveq   #0, d1
+    move.b  STE_DMA_CNT_MID.w, d1
+    move.w  d1, d3                       ; keep the raw mid byte
+    andi.w  #$7F, d1
+    lsl.w   #8, d1
+    move.b  STE_DMA_CNT_LO.w, d1
+    subi.w  #STE_SND_BUF_MASK, d1        ; d1 = offset into the current buffer
+    lsr.w   #7, d3
+    andi.w  #1, d3                       ; d3 = 0 in buffer A, 1 in buffer B
+
+    ; Steer the length from how the offset drifts. Sampled at the same
+    ; point in every frame, it sits still when the chip is eating
+    ; exactly one buffer per VBL; it creeps forward when the chip is
+    ; running fast (buffers too short) and backwards when it is slow.
+    ; Which way it moved is the whole signal -- the true ratio never has
+    ; to be known, only its sign.
+    ;
+    ; Correcting on every frame overshoots and hunts, so the offset is
+    ; sampled every frame but the length only moves on every fourth,
+    ; which leaves time for the previous nudge to show up. A handover
+    ; resets the offset and produces a large jump; those frames are
+    ; ignored rather than acted on.
+    ;
+    ; In mono only the VBL that ends a frame is sampled. The two halves
+    ; reach this point a couple of hundred cycles apart, and sampling
+    ; both would put that difference into every comparison with the same
+    ; sign -- steering the length a fraction of a sample off, so the
+    ; chip's phase walks round the VBL and a buffer is replayed each
+    ; time it laps. Two VBLs at a time, it is the same point every time.
+    tst.b   UFW_HALF
+    bne.s   .snd_len_report
+    addq.b  #1, UFW_SND_TICK
+    move.b  UFW_SND_TICK, d2
+    andi.b  #3, d2
+    bne.s   .snd_len_keep
+    move.w  d1, d2
+    sub.w   UFW_SND_PREVPOS, d2          ; d2 = drift since last frame
+    cmpi.w  #64, d2
+    bgt.s   .snd_len_keep                ; handover, not drift
+    cmpi.w  #-64, d2
+    blt.s   .snd_len_keep
+    tst.w   d2
+    beq.s   .snd_len_keep
+    bgt.s   .snd_len_inc
+    subq.w  #1, UFW_SND_LEN              ; chip falling behind: shorten
+    cmpi.w  #STE_SND_LEN_MIN, UFW_SND_LEN
+    bcc.s   .snd_len_keep
+    move.w  #STE_SND_LEN_MIN, UFW_SND_LEN
+    bra.s   .snd_len_keep
+.snd_len_inc:
+    addq.w  #1, UFW_SND_LEN              ; chip gaining: lengthen
+    cmpi.w  #STE_SND_LEN_MAX, UFW_SND_LEN
+    bls.s   .snd_len_keep
+    move.w  #STE_SND_LEN_MAX, UFW_SND_LEN
+.snd_len_keep:
+    move.w  d1, UFW_SND_PREVPOS
+
+    ; Tell the RP how many samples to produce next frame, biased by the
+    ; minimum so the whole range fits a byte.
+.snd_len_report:
+    move.w  UFW_SND_LEN, d1
+    subi.w  #STE_SND_LEN_MIN, d1
+    lea     SNDLEN_WINDOW_BASE, a1
+    tst.b   (a1, d1.w)
+
+    ; Refill the buffer the chip is NOT in. The loop already points at
+    ; it (userfw_snd_irq).
+    tst.b   d3
     bne.s   .snd_use_a                   ; DMA in B -> refill A
     move.l  #STE_SND_BUF_B, d2           ; DMA in A -> refill B
     bra.s   .snd_have_buf
 .snd_use_a:
     move.l  #STE_SND_BUF_A, d2
 .snd_have_buf:
-    ; Copy one VBL of fresh signed PCM from the cart buffer into d2.
+    ; Fixed-size copy from the cart buffer; END (set by userfw_snd_irq
+    ; from UFW_SND_LEN) decides how much of it is actually played.
     lea     AUDIO_BUFFER_ADDR, a1
     movea.l d2, a2
-    move.w  UFW_SND_COPY, d1
+    move.w  #(STE_SND_COPY/4)-1, d1
 .ste_snd_copy:
     move.l  (a1)+, (a2)+
     dbf     d1, .ste_snd_copy
-    ; Point the DMA loop at the just-filled buffer: start = d2,
-    ; end = d2 + UFW_SND_LEN (each split hi/mid/lo).
-    move.l  d2, d3
-    move.b  d3, STE_DMA_START_LO.w
-    lsr.l   #8, d3
-    move.b  d3, STE_DMA_START_MID.w
-    lsr.l   #8, d3
-    move.b  d3, STE_DMA_START_HI.w
-    moveq   #0, d1
-    move.w  UFW_SND_LEN, d1
-    add.l   d1, d2
-    move.b  d2, STE_DMA_END_LO.w
-    lsr.l   #8, d2
-    move.b  d2, STE_DMA_END_MID.w
-    lsr.l   #8, d2
-    move.b  d2, STE_DMA_END_HI.w
 .no_dma_refill:
 
-    ; Half a mono frame: no flip and no ack -- the cart FB is not free,
-    ; because the rest is copied out of it next VBL.
+    ; Half a mono frame: no flip, and an ack that only says "a VBL went
+    ; by" -- the RP keys its audio refill off it, but must not take the
+    ; cart FB as free, because the rest is copied out of it next VBL.
     tst.b   UFW_HALF
-    bne.s   .input_check
+    beq.s   .frame_done
+    tst.b   VBLSYNC_HALF_ADDR
+    bra.s   .input_check
+.frame_done:
 
     ; Flip the video base to the just-written page. A5 still holds
     ; UFW_SCREEN_PAGE (preserved by FBDRV_INLINE). Only the MID byte
@@ -961,9 +1092,39 @@ userfw_timerb_audio:
     rte
 
 ; -------------------------------------------------------------------
+; userfw_snd_irq -- MFP Timer-A in event-count mode, one event per STE
+; DMA sound frame end. The chip has just latched START/END and begun the
+; other buffer, so point START/END at the buffer it left; the VBL loop
+; fills that one during the frame (.after_copy). Done here, the update
+; is a whole frame away from the next latch and can never be caught
+; half-written (see the STE_SND_BUF comment for what that did). Only the
+; MID byte of START and the MID/LO bytes of END differ between the two
+; buffers; the HI bytes ($07) were written at boot. UFW_SND_LEN is
+; steered by the VBL loop with single-instruction adds, so the read here
+; is atomic. Saves D0 only; auto-EOI, so no in-service ack; level 6, so
+; it can fire inside FBDRV_INLINE like Timer-B.
+userfw_snd_irq:
+    move.l  d0, -(sp)
+    btst    #7, STE_DMA_CNT_MID.w         ; 1 = the chip is now in B
+    beq.s   .snd_irq_in_a
+    move.b  #((STE_SND_BUF_A>>8)&$FF), STE_DMA_START_MID.w
+    move.l  #STE_SND_BUF_A, d0
+    bra.s   .snd_irq_end
+.snd_irq_in_a:
+    move.b  #((STE_SND_BUF_B>>8)&$FF), STE_DMA_START_MID.w
+    move.l  #STE_SND_BUF_B, d0
+.snd_irq_end:
+    add.w   UFW_SND_LEN, d0               ; <= 512: no carry out of the low word
+    move.b  d0, STE_DMA_END_LO.w
+    lsr.w   #8, d0
+    move.b  d0, STE_DMA_END_MID.w
+    move.l  (sp)+, d0
+    rte
+
+; -------------------------------------------------------------------
 ; userfw_dummy_irq -- single-rte IRQ handler for vectors we want to
-; silence (HBL $68, Timer-A $134, Timer-C $114, Timer-D $110, ACIA
-; $118). Stopping TOS's handlers cuts the per-frame jitter they
+; silence (HBL $68, Timer-A $134 until the STE DMA path claims it,
+; Timer-C $114, Timer-D $110, ACIA $118). Stopping TOS's handlers cuts the per-frame jitter they
 ; impose on the blit; we don't need their behaviour because the
 ; framebuffer template owns the screen + IKBD until ESC exit.
 userfw_dummy_irq:

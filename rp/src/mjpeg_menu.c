@@ -28,6 +28,7 @@
 #include "fb_font.h"
 #include "ff.h"
 #include "ikbd.h"
+#include "mjpeg.h"
 #include "palette.h"
 
 extern const struct FB_FONT font8x8; /* defined in fb.c */
@@ -391,6 +392,13 @@ int mjpeg_menu_key(uint8_t scancode) {
 }
 
 void mjpeg_menu_render(void) {
+  /* After a video ends (mjpeg_finish) its last frame stays behind the
+   * menu, in its own palette, as the menu over a playing video does. */
+  if (mjpeg_menu_shown()) {
+    draw(&MenuOverVideo);
+    fb_publish();
+    return;
+  }
   /* Known palette, overriding any quantized palette a previous video
    * left in place. */
   palette_set(MenuPalette);

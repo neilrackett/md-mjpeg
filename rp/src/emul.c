@@ -100,6 +100,7 @@ void emul_start() {
   }
   palette_init();
   audio_init();
+  audio_start_vbl_timer(); /* Core 1 refills the audio after each m68k ack */
 
   FATFS fsys;
   cart_check("pre-sd");
@@ -179,14 +180,14 @@ void emul_start() {
           DPRINTF("HB: %s\n", dbg);
         }
       } else {
-        /* Reached the end -- stop and return to the menu. */
-        mjpeg_close();
+        /* Reached the end -- stop and return to the menu, over the last
+         * frame. */
+        mjpeg_finish();
         state = STATE_MENU;
       }
     } else {
       mjpeg_menu_render(); /* draws + publishes, VBL-paced */
     }
-    audio_render_frame();
     cart_check("main-loop");
   }
 }

@@ -34,13 +34,18 @@
  * routes ROM3 samples to both the IKBD demux and this detector;
  * fb_publish() blocks until s_vbl_seen advances before overwriting
  * the cart FB. The ~33 ms timeout keeps the RP from hanging if the
- * m68k isn't emitting acks (e.g. before it boots). In mono only the VBL
- * that ends a frame acks; the one after the first half does not. */
-#define FB_VBLSYNC_HIBYTE   0x8400u
-#define FB_VBLSYNC_HIMASK   0xFF00u
+ * m68k isn't emitting acks (e.g. before it boots). Only $FB8400 itself
+ * is a frame ack: in mono the VBL after the first half reads $FB8401,
+ * which audio.c refills on but which says nothing about the cart FB,
+ * half of which is still to be copied. */
+#define FB_VBLSYNC_ADDR     0x8400u
 /* Sound-capability report window ($FB8600 = YM, $FB8601 = DMA). */
 #define FB_SNDCAP_HIBYTE    0x8600u
 #define FB_SNDCAP_HIMASK    0xFF00u
+/* STE DMA sound length report, one read per VBL ($FB8C00 + the bytes
+ * the chip eats per VBL less a bias; SNDLEN_WINDOW_BASE in userfw.s). */
+#define FB_SNDLEN_HIBYTE    0x8C00u
+#define FB_SNDLEN_HIMASK    0xFF00u
 /* Display report, one read per VBL: $FB9000 + 1 when the ST is in high
  * res on a mono monitor (VIDEO_WINDOW_BASE in userfw.s). */
 #define FB_VIDEO_HIBYTE     0x9000u
@@ -266,7 +271,7 @@ void fb_render_frame(void) {
  * demux and to the VBL frame-sync detector. */
 static void fb_rom3_dispatch(uint16_t sample) {
   ikbd_consume_rom3_sample(sample);
-  if ((sample & FB_VBLSYNC_HIMASK) == FB_VBLSYNC_HIBYTE) {
+  if (sample == FB_VBLSYNC_ADDR) {
     s_vbl_seen++;
   }
   if ((sample & FB_VIDEO_HIMASK) == FB_VIDEO_HIBYTE) {
@@ -278,6 +283,9 @@ static void fb_rom3_dispatch(uint16_t sample) {
    * audio back-end so the RP produces the matching format. */
   if ((sample & FB_SNDCAP_HIMASK) == FB_SNDCAP_HIBYTE) {
     audio_set_mode((sample & 1u) ? AUDIO_MODE_DMA : AUDIO_MODE_YM);
+  }
+  if ((sample & FB_SNDLEN_HIMASK) == FB_SNDLEN_HIBYTE) {
+    audio_sndlen_report(sample & 0xFFu);
   }
 }
 

@@ -48,7 +48,8 @@ int mjpeg_menu_key(uint8_t scancode);
 
 /* Draw the menu (or the About page) on its own, on a cleared screen, and
  * publish it. Sets its own known palette, so it is safe to call straight
- * after the quantized video palette. */
+ * after the quantized video palette. After a video has ended
+ * (mjpeg_finish), it draws over that video's last frame instead. */
 void mjpeg_menu_render(void);
 
 /* Draw the menu (or the About page) over the frame in fb_chunked_buffer,
