@@ -67,9 +67,9 @@ BLIT_MARK_VSYNC       equ $000               ; black: vsync returned, copy not y
 BLIT_MARK_RUNNING     equ $777               ; white: cart->ST copy in flight
 BLIT_MARK_DONE        equ $070               ; green: FBDRV_INLINE returned
 
-; Shifter resolution: 0 = low, 1 = medium, 2 = high (mono). At cartridge
-; init a colour monitor is always in low res, so this tells colour from
-; mono.
+; Shifter resolution: 0 = low, 1 = medium, 2 = high (mono). main.s has
+; already switched anything but low and high to low, so this tells
+; colour from mono.
 SHIFTER_RES           equ $FFFF8260
 SHIFTER_RES_HIGH      equ 2
 ; In mono only bit 0 of colour 0 counts: set, and a 0 pixel is white
