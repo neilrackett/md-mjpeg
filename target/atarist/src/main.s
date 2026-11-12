@@ -35,7 +35,9 @@ ROM4_ADDR			equ $FA0000
 ;   $FA4008  RANDOM_TOKEN_SEED_ADDR	4 B  (legacy / unused since Epic 3.8)
 ;   $FA400C  FB_FRAME_COUNTER_ADDR	4 B
 ;   $FA4010  SHARED_VARIABLES		240 B (60 x 4-byte slots, app-free).
-;   $FA4100  APP_FREE_ADDR	      ~16.5 KB free arena, ends at FRAMEBUFFER
+;   $FA4100  AUDIO_BUFFER_ADDR		1 KB
+;   $FA4500  SPEAKER_ADDR		2 B  (TT internal speaker on/off)
+;   $FA4502  APP_FREE_ADDR	      ~15.5 KB free arena, ends at FRAMEBUFFER
 ;   $FA8300  FRAMEBUFFER_ADDR	      32000 B (320x200 4bpp, flush at top)
 ;   $FAFFFF  end of region
 
@@ -59,8 +61,11 @@ AUDIO_BUFFER_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA4100
 AUDIO_BUFFER_SIZE	equ 1024
 AUDIO_BUFFER_END	equ (AUDIO_BUFFER_ADDR + AUDIO_BUFFER_SIZE)	; $FA4500
 
-; APP_FREE starts after the audio buffer.
-APP_FREE_ADDR		equ AUDIO_BUFFER_END				; $FA4500
+; The menu's TT speaker setting, one word (userfw.s SPEAKER_ADDR).
+SPEAKER_ADDR		equ AUDIO_BUFFER_END				; $FA4500
+
+; APP_FREE starts after the speaker word.
+APP_FREE_ADDR		equ (SPEAKER_ADDR + 2)				; $FA4502
 FBDRV_ADDR		equ (ROM4_ADDR + $2000)				; $FA2000 (MOVEM loop cart->ST screen copy)
 
 ; Transitional: the pre-Story-1.2 boot UI fills only the first 8000 bytes

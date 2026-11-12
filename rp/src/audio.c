@@ -100,6 +100,30 @@ void audio_sndlen_report(uint32_t report) {
   }
 }
 
+/* Latched: the machine cannot stop being a TT, and a menu row that never
+ * goes away once shown keeps the menu's selection valid. */
+static bool s_tt;
+static bool s_tt_speaker;
+
+void audio_report_tt(void) {
+  if (!s_tt) {
+    s_tt = true;
+    DPRINTF("audio: a TT, speaker switchable\n");
+  }
+}
+
+bool audio_has_tt_speaker(void) { return s_tt; }
+
+void audio_set_tt_speaker(bool on) {
+  s_tt_speaker = on;
+  volatile uint16_t *spk =
+      (volatile uint16_t *)((uint8_t *)&__rom_in_ram_start__ +
+                            CART_SPEAKER_OFFSET);
+  *spk = on ? 1u : 0u;
+}
+
+bool audio_get_tt_speaker(void) { return s_tt_speaker; }
+
 audio_mode_t audio_get_mode(void) { return s_audio_mode; }
 
 uint32_t audio_get_fill_bytes(void) { return fill_bytes(); }

@@ -80,6 +80,20 @@ void audio_set_mono(bool mono);
  * bias. Called by fb.c's decoder; sets the DMA refill size. */
 void audio_sndlen_report(uint32_t report);
 
+/* A TT: bit 1 of the sound-capability report. Called by fb.c's decoder;
+ * latched, as the machine cannot stop being a TT. */
+void audio_report_tt(void);
+
+/* True once a TT has been reported, whose internal speaker the menu can
+ * switch on and off; false until then and on every other machine. */
+bool audio_has_tt_speaker(void);
+
+/* The TT speaker setting: published to the cart region for the m68k to
+ * apply at its next VBL, on a TT only. Off until set (the region starts
+ * zeroed), and put back as TOS had it on the exit to GEM. */
+void audio_set_tt_speaker(bool on);
+bool audio_get_tt_speaker(void);
+
 /* Current back-end, for the fill callback to pick its output format. */
 audio_mode_t audio_get_mode(void);
 

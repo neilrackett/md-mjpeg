@@ -108,6 +108,9 @@ UFW_HALF              equ $00077FF1          ; byte: $FF = mono frame half copie
 UFW_SND_LEN           equ $00077FF2          ; word: current DMA buffer length in bytes
 UFW_SND_PREVPOS       equ $00077FF4          ; word: DMA offset within its buffer, last VBL
 UFW_SND_TICK          equ $00077FF6          ; byte: frame counter, steer on every 4th
+UFW_SNDCAP            equ $00077FF7          ; byte: the SNDCAP report (SNDCAP_* bits)
+UFW_SPK_STATE         equ $00077FF8          ; byte: TT speaker setting last applied ($00 off, $FF on, $01 none yet)
+UFW_SPK_PORTA         equ $00077FF9          ; byte: YM port A as TOS left it (TT: bit 6 put back on exit)
 
 ; fbdrv iteration arithmetic. Pulled out as equs so the macro body
 ; below doesn't carry literal magic numbers. FBDRV_TOTAL_BYTES is
@@ -272,6 +275,14 @@ YM_REG_CHA_VOL        equ 8                  ; channel A volume (low 4 bits)
 YM_REG_CHB_VOL        equ 9                  ; channel B volume (low 4 bits)
 YM_MIXER_DAC_CHA      equ $FE                ; tone A enabled, all other tones/noise off, ports out
 YM_MIXER_DAC_AB       equ $FC                ; tones A AND B enabled, tone C off, all noise off, ports out (Ghostbusters dual-channel fake DAC)
+YM_REG_PORT_A         equ 14                 ; I/O port A: floppy selects, RTS/DTR, printer strobe, bits 6/7 per machine
+YM_PORTA_TT_SPEAKER   equ 6                  ; TT: internal speaker enable, active low (0 = speaker off)
+
+; The menu's TT speaker setting, published by the RP (cart_shared.h
+; CART_SPEAKER_OFFSET; must match): one word, 0 = off (as the erased cart
+; region starts), else on. Applied by ufw_speaker_apply each VBL, on a TT
+; only.
+SPEAKER_ADDR          equ $00FA4500
 
 ; Cart-shared audio sample buffer (mirrors AUDIO_BUFFER_ADDR /
 ; AUDIO_BUFFER_SIZE in main.s and CART_AUDIO_BUFFER_OFFSET in
@@ -358,12 +369,16 @@ STE_SND_LEN_MAX       equ 512                ; must not exceed STE_SND_COPY
 ; Cookie jar (_p_cookies) + _SND cookie for DMA-sound detection.
 COOKIE_JAR_PTR        equ $000005A0          ; longword: cookie jar base (0 = none)
 COOKIE_SND            equ $5F534E44          ; '_SND'; value bit 1 = DMA/PCM sound
+COOKIE_MCH            equ $5F4D4348          ; '_MCH'; value high word = machine
+MCH_TT                equ 2                  ; _MCH high word of a TT
 
 ; Sound-capability report window: the m68k reads (SNDCAP_WINDOW_BASE +
-; has_dma) each VBL; the RP commemul ring decodes the low bit and
-; produces the matching audio format. Distinct from IKBD ($FB8200)
-; and VBLSYNC ($FB8400).
+; UFW_SNDCAP) each VBL. Bit 0: DMA sound, so the RP produces the
+; matching audio format; bit 1: a TT, so the RP's menu offers the TT
+; speaker setting. Distinct from IKBD ($FB8200) and VBLSYNC ($FB8400).
 SNDCAP_WINDOW_BASE    equ $FB8600
+SNDCAP_DMA            equ 0                  ; bit: STE DMA sound (= UFW_HAS_DMA)
+SNDCAP_TT_SPEAKER     equ 1                  ; bit: a TT, whose internal speaker the menu switches
 
 ; Buffer-length report: the m68k reads (SNDLEN_WINDOW_BASE + len -
 ; STE_SND_LEN_MIN) once per VBL while STE DMA sound is running, so the
@@ -504,30 +519,32 @@ userfw:
 .res_colour:
 
     ; --- Detect STE DMA sound via the _SND cookie (bit 1) ---------
-    ; Walk the cookie jar; a null jar or a missing _SND (plain ST /
-    ; early TOS) leaves has_dma = 0 -> YM fallback. FORCE_NO_DMA=1
-    ; skips the walk entirely so the fallback can be tested on an STE.
-    ; Clobbers D0/D1/A0 -- all reloaded by the boot code that follows.
-    moveq   #0, d0                   ; assume no DMA sound
+    ; A null jar or a missing _SND (plain ST / early TOS) leaves
+    ; has_dma = 0 -> YM fallback. FORCE_NO_DMA=1 skips the lookup
+    ; entirely so the fallback can be tested on an STE.
+    ; Clobbers D0-D2/A1 -- all reloaded by the boot code that follows.
+    moveq   #0, d2                   ; assume no DMA sound
     ifeq    FORCE_NO_DMA
-    move.l  COOKIE_JAR_PTR.w, d1     ; cookie jar base
-    beq.s   .snd_detect_done         ; null jar -> no cookies
-    movea.l d1, a0
-.snd_cookie_loop:
-    move.l  (a0), d1                 ; cookie tag
-    beq.s   .snd_detect_done         ; tag 0 = end of jar, _SND not found
-    cmp.l   #COOKIE_SND, d1
-    beq.s   .snd_found
-    addq.l  #8, a0                   ; next 8-byte entry (tag, value)
-    bra.s   .snd_cookie_loop
-.snd_found:
-    move.l  4(a0), d1               ; _SND value
-    btst    #1, d1                  ; bit 1 = DMA / PCM sound
+    move.l  #COOKIE_SND, d1
+    bsr     ufw_cookie               ; d0 = _SND value, 0 if none
+    btst    #1, d0                   ; bit 1 = DMA / PCM sound
     beq.s   .snd_detect_done
-    moveq   #1, d0                  ; DMA sound present
+    moveq   #1, d2                   ; DMA sound present
     endc
 .snd_detect_done:
-    move.b  d0, UFW_HAS_DMA
+    move.b  d2, UFW_HAS_DMA
+
+    ; --- A TT? (_MCH $0002xxxx) The menu switches its internal speaker,
+    ; so the RP is told through the SNDCAP report, with the DMA bit.
+    move.l  #COOKIE_MCH, d1
+    bsr     ufw_cookie               ; d0 = _MCH value, 0 (an ST) if none
+    swap    d0
+    cmp.w   #MCH_TT, d0
+    bne.s   .tt_detect_done
+    bset    #SNDCAP_TT_SPEAKER, d2
+.tt_detect_done:
+    move.b  d2, UFW_SNDCAP
+    move.b  #1, UFW_SPK_STATE        ; neither off nor on: the first VBL applies the setting
 
     ; Save TOS's VBL vector and install ours. We're in supervisor mode
     ; (entered via CA_INIT) so writing $70.w is legal.
@@ -568,6 +585,14 @@ userfw:
     move.b  MFP_IMRA.w, 26(a5)
     move.b  MFP_IMRB.w, 27(a5)
     move.b  MFP_VR.w, 28(a5)             ; TOS uses S=1 (software EOI); we override below
+
+    ; A TT: save port A as TOS left it, so the exit can put the internal
+    ; speaker back the way it found it (ufw_speaker_apply switches it).
+    btst    #SNDCAP_TT_SPEAKER, UFW_SNDCAP
+    beq.s   .spk_saved
+    move.b  #YM_REG_PORT_A, YM_SELECT.w
+    move.b  YM_SELECT.w, UFW_SPK_PORTA   ; a read of the select register reads the latched one
+.spk_saved:
 
     ; Install dummies at HBL / Timer-A / Timer-B / Timer-C / Timer-D
     ; / ACIA. userfw_dummy_irq is a single rte; PC-relative for the
@@ -768,6 +793,11 @@ userfw:
     movem.l d0-d7, PALETTE_BASE.w
 .palette_done:
 
+    ; The TT's internal speaker, as the menu has it (no-op unless this is
+    ; a TT and the setting changed). Clobbers D0/D1/A2, which the blit
+    ; below clobbers anyway.
+    bsr     ufw_speaker_apply
+
     ; Pure 68000 CPU copy via the FBDRV_INLINE macro (defined in
     ; the constants block). Same code path on plain ST / STE /
     ; MegaSTE / TT / Falcon -- no _MCH cookie dispatch, no STE
@@ -831,11 +861,12 @@ userfw:
     tst.b   (a1, d1.w)
 
     ; Report sound capability to the RP every VBL: one cart-bus read at
-    ; SNDCAP_WINDOW_BASE + has_dma. The RP's commemul ring decodes the
+    ; SNDCAP_WINDOW_BASE + UFW_SNDCAP. The RP's commemul ring decodes the
     ; low bit and produces the matching audio format (signed PCM for
-    ; DMA, downsampled YM pairs otherwise). A1/D1 are scratch.
+    ; DMA, downsampled YM pairs otherwise); bit 1 (a TT) shows the menu's
+    ; TT speaker setting. A1/D1 are scratch.
     moveq   #0, d1
-    move.b  UFW_HAS_DMA, d1
+    move.b  UFW_SNDCAP, d1
     lea     SNDCAP_WINDOW_BASE, a1
     tst.b   (a1, d1.w)
 
@@ -997,6 +1028,20 @@ userfw:
     clr.b   MFP_TBCR.w
     clr.b   MFP_TACR.w
 
+    ; A TT: its internal speaker back as TOS had it. Only bit 6: the rest
+    ; of port A (the floppy selects among them) is left as it now stands.
+    btst    #SNDCAP_TT_SPEAKER, UFW_SNDCAP
+    beq.s   .spk_restored
+    move.b  #YM_REG_PORT_A, YM_SELECT.w
+    move.b  YM_SELECT.w, d0
+    bclr    #YM_PORTA_TT_SPEAKER, d0
+    btst    #YM_PORTA_TT_SPEAKER, UFW_SPK_PORTA
+    beq.s   .spk_restore
+    bset    #YM_PORTA_TT_SPEAKER, d0
+.spk_restore:
+    move.b  d0, YM_DATA.w
+.spk_restored:
+
     ; Restore MFP IER / IMR.
     move.b  24(a5), MFP_IERA.w
     move.b  25(a5), MFP_IERB.w
@@ -1027,6 +1072,65 @@ userfw:
     move.w  #5, -(sp)                 ; XBIOS Setscreen
     trap    #14
     lea     12(sp), sp
+    rts
+
+; -------------------------------------------------------------------
+; ufw_speaker_apply -- once per VBL, on a TT only: switch its internal
+; speaker to follow the menu's TT speaker setting (SPEAKER_ADDR). The
+; speaker's enable is bit 6 of the YM's port A, active low: the TT030
+; hardware reference lists it as "*Speaker Disable (0 disables internal
+; speaker)". The other port A bits are the floppy selects, the printer
+; strobe, RTS/DTR and the LAN select, so this is a read-modify-write, and
+; only when the setting has changed (UFW_SPK_STATE starts at neither, so
+; the first VBL applies the default, off).
+;
+; The YM is only touched at IPL 7, and reg 8 is latched again last: both
+; for the Timer-B handler, which shares the register latch and relies on
+; reg 8 being latched between fires (it only runs on a TT in a
+; FORCE_NO_DMA build).
+;
+; Clobbers D0/D1/A2. A0 (the Timer-B cursor) is left alone.
+ufw_speaker_apply:
+    btst    #SNDCAP_TT_SPEAKER, UFW_SNDCAP
+    beq.s   .spk_ret                      ; not a TT
+    tst.w   SPEAKER_ADDR
+    sne     d1                            ; d1: $FF on, $00 off
+    cmp.b   UFW_SPK_STATE, d1
+    beq.s   .spk_ret                      ; as it is already
+    move.b  d1, UFW_SPK_STATE
+    lea     YM_SELECT.w, a2
+    move.w  sr, -(sp)
+    ori.w   #$0700, sr
+    move.b  #YM_REG_PORT_A, (a2)
+    move.b  (a2), d0                      ; port A as it stands
+    bclr    #YM_PORTA_TT_SPEAKER, d0      ; off...
+    tst.b   d1
+    beq.s   .spk_write
+    bset    #YM_PORTA_TT_SPEAKER, d0      ; ...or on
+.spk_write:
+    move.b  d0, 2(a2)
+    move.b  #YM_REG_CHA_VOL, (a2)         ; reg 8 latched again for Timer-B
+    move.w  (sp)+, sr
+.spk_ret:
+    rts
+
+; -------------------------------------------------------------------
+; ufw_cookie -- look a cookie up in the jar. D1 = its tag. Returns its
+; value in D0, or 0 when there is no jar or no such cookie. Clobbers A1.
+ufw_cookie:
+    move.l  COOKIE_JAR_PTR.w, d0          ; cookie jar base
+    beq.s   .cookie_ret                   ; no jar: 0
+    movea.l d0, a1
+.cookie_loop:
+    move.l  (a1)+, d0                     ; tag
+    beq.s   .cookie_ret                   ; end of the jar: 0
+    cmp.l   d1, d0
+    beq.s   .cookie_found
+    addq.l  #4, a1                        ; skip its value
+    bra.s   .cookie_loop
+.cookie_found:
+    move.l  (a1), d0                      ; value
+.cookie_ret:
     rts
 
 ; -------------------------------------------------------------------

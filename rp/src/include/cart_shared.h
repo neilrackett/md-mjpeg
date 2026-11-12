@@ -43,7 +43,10 @@
  *                                        previous iteration)
  *   $FA4010  SHARED_VARIABLES    240 B  (60 indexed 4-byte slots,
  *                                        app-free).
- *   $FA4100  APP_FREE           ~16.5 KB free arena, ends at FRAMEBUFFER
+ *   $FA4100  AUDIO_BUFFER          1 KB (see below)
+ *   $FA4500  SPEAKER               2 B  (TT internal speaker on/off, see
+ *                                        CART_SPEAKER_OFFSET)
+ *   $FA4502  APP_FREE           ~15.5 KB free arena, ends at FRAMEBUFFER
  *   $FA8300  FRAMEBUFFER          32 KB (320x200 4 bpp low-res)
  *   $FAFFFF  end of region
  */
@@ -81,9 +84,16 @@
   (CART_SHARED_VARIABLES_OFFSET + (CART_SHARED_VARIABLES_SLOTS * 4))
 #define CART_AUDIO_BUFFER_SIZE           1024
 
-/* APP_FREE arena starts after the audio buffer. */
-#define CART_APP_FREE_OFFSET                                                  \
-  (CART_AUDIO_BUFFER_OFFSET + CART_AUDIO_BUFFER_SIZE)
+/* TT internal speaker ($FA4500): one word, the menu's TT speaker setting
+ * (audio_set_tt_speaker): 0 = off, 1 = on. Zero, as the erased region
+ * starts, is off, the default. On a TT only, the m68k applies it at its
+ * next VBL by switching bit 6 of the YM's port A (userfw.s
+ * ufw_speaker_apply). Must match SPEAKER_ADDR in userfw.s. */
+#define CART_SPEAKER_OFFSET                                                   \
+  (CART_AUDIO_BUFFER_OFFSET + CART_AUDIO_BUFFER_SIZE) /* $4500 */
+
+/* APP_FREE arena starts after the speaker word. */
+#define CART_APP_FREE_OFFSET (CART_SPEAKER_OFFSET + 2)
 
 /* Framebuffer sized for low-res 4 bpp (320 x 200 = 32000 bytes). Sits
  * flush against the top of the 64 KB region: end = $FB0000 exactly,

@@ -39,9 +39,12 @@
  * which audio.c refills on but which says nothing about the cart FB,
  * half of which is still to be copied. */
 #define FB_VBLSYNC_ADDR     0x8400u
-/* Sound-capability report window ($FB8600 = YM, $FB8601 = DMA). */
+/* Sound-capability report window ($FB8600..3): bit 0 DMA sound (else
+ * the YM), bit 1 a TT, whose internal speaker the menu switches. */
 #define FB_SNDCAP_HIBYTE    0x8600u
 #define FB_SNDCAP_HIMASK    0xFF00u
+#define FB_SNDCAP_DMA       0x01u
+#define FB_SNDCAP_TT        0x02u
 /* STE DMA sound length report, one read per VBL ($FB8C00 + the bytes
  * the chip eats per VBL less a bias; SNDLEN_WINDOW_BASE in userfw.s). */
 #define FB_SNDLEN_HIBYTE    0x8C00u
@@ -279,10 +282,13 @@ static void fb_rom3_dispatch(uint16_t sample) {
     audio_set_mono(s_st_mono);
   }
   /* Sound-capability report (userfw.s emits it each VBL at
-   * SNDCAP_WINDOW_BASE + has_dma = $FB8600/$FB8601). Low bit picks the
-   * audio back-end so the RP produces the matching format. */
+   * SNDCAP_WINDOW_BASE + UFW_SNDCAP). Bit 0 picks the audio back-end so
+   * the RP produces the matching format; bit 1 says this is a TT. */
   if ((sample & FB_SNDCAP_HIMASK) == FB_SNDCAP_HIBYTE) {
-    audio_set_mode((sample & 1u) ? AUDIO_MODE_DMA : AUDIO_MODE_YM);
+    audio_set_mode((sample & FB_SNDCAP_DMA) ? AUDIO_MODE_DMA : AUDIO_MODE_YM);
+    if (sample & FB_SNDCAP_TT) {
+      audio_report_tt();
+    }
   }
   if ((sample & FB_SNDLEN_HIMASK) == FB_SNDLEN_HIBYTE) {
     audio_sndlen_report(sample & 0xFFu);

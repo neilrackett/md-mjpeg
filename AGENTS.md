@@ -40,7 +40,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
 | `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
-| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos, the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish), and at the end of a video over its last frame (`mjpeg_finish()`: `mjpeg_menu_shown()` stays true, and `mjpeg_menu_render()` draws over the frame instead of clearing it) in the frame's pens 0 and 15: pen 0 is always black, and the quantizer holds 15 at white while `mjpeg_menu_shown()` (`mq_republish()` applies it at once) (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
+| `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos (and, on a TT, TT SPEAKER: see "TT speaker"), the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish), and at the end of a video over its last frame (`mjpeg_finish()`: `mjpeg_menu_shown()` stays true, and `mjpeg_menu_render()` draws over the frame instead of clearing it) in the frame's pens 0 and 15: pen 0 is always black, and the quantizer holds 15 at white while `mjpeg_menu_shown()` (`mq_republish()` applies it at once) (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/fb_mono.c` | ST high res: the chunked 320×200 pens as a 640×400 one-bit picture, doubled and blue-noise dithered (see "ST high res"); shared by the hardware and EmuMD builds |
 | `rp/src/emul.c` | boot sequence, FOLDER config self-heal, .AVI discovery, main loop (menu, playing, menu over the video), cart-corruption canary |
@@ -460,6 +460,35 @@ On the YM path the refill lands while Timer-B is near the end of the
 buffer, so the last few samples of a VBL come from the next one (MD/DOOM
 has the same, as a known issue).
 
+### TT speaker
+
+Ported from MD/Speccy. On a TT only, the menu has a **TT SPEAKER** row
+(OFF, the default, or ON; Left/Right set it, Return toggles it) for the
+TT's internal speaker. Its enable is bit 6 of the YM's port A, **active
+low**: the TT030 Hardware Reference Manual's port A table reads
+"*Speaker Disable (0 disables internal speaker)" (Hatari doesn't emulate
+the speaker, and EmuTOS boots a TT with it clear). Don't reuse this on a
+Falcon without checking its polarity.
+
+- `userfw.s` finds a TT from `_MCH` (high word 2) through `ufw_cookie`
+  (shared with the `_SND` lookup) and reports it as bit 1 of SNDCAP;
+  `fb_rom3_dispatch` → `audio_report_tt()` latches it.
+- The row is the last setting, just above the videos, and appears only
+  once a TT has been reported — which can be after the menu has opened,
+  so `sync_tt()` in `mjpeg_menu.c` moves the selection down with the
+  videos when it does.
+- `audio_set_tt_speaker()` writes the setting to `CART_SPEAKER_OFFSET`
+  (`$FA4500`, just after the audio buffer); zero, as the erased region
+  starts, is off. It isn't saved: every run starts with the speaker off.
+  `ufw_speaker_apply` read-modify-writes port A at IPL 7 on a TT when the
+  value changes (the other bits are the floppy selects, printer strobe,
+  RTS/DTR and LAN select), then latches reg 8 again for Timer-B. Boot
+  saves port A; the exit to GEM puts bit 6 back.
+
+Run in EmuMD with `make emu MACHINE=tt TOS=<EmuTOS 512k image>`: the
+256k EmuTOS EmuMD downloads can't run a TT, and Hatari silently falls
+back to an STE. Hatari's `--trace psg_write` shows the port A writes.
+
 ### Shared 64 KB cartridge region (`$FA0000` ↔ RP `0x20030000`)
 
 Offsets are defined in `rp/src/include/cart_shared.h` (RP) and
@@ -473,7 +502,8 @@ Offsets are defined in `rp/src/include/cart_shared.h` (RP) and
 | `$FA4010` | `SHARED_VARIABLES` | 240 B | 60 × 4 B slots |
 | `$FA4040` | `PALETTE` | 32 B | 16 ST palette words, applied by m68k every VBL |
 | `$FA4100` | `AUDIO_BUFFER` | 1 KB | YM sample pairs |
-| `$FA4500` | `APP_FREE` | ~15.5 KB | free arena |
+| `$FA4500` | `SPEAKER` | 2 B | the menu's TT speaker setting (0 off, 1 on), see "TT speaker" |
+| `$FA4502` | `APP_FREE` | ~15.5 KB | free arena |
 | `$FA8300` | `FRAMEBUFFER` | 32 000 B | 320×200×4bpp planar FB (640×400×1bpp in mono), chunk-reversed for the MOVEM copy |
 
 The m68k cannot write the region, so it talks to the RP by **reading** ROM3
@@ -485,7 +515,7 @@ The m68k cannot write the region, so it talks to the RP by **reading** ROM3
 | `$FB8200 + byte` | IKBD byte (`ikbd.c`) |
 | `$FB8400` | frame ack: the copy is done, the cart FB may be rewritten (in mono only on the VBL that ends a frame); refills the audio |
 | `$FB8401` | mono, the VBL after a frame's first half: refills the audio, but not a frame ack |
-| `$FB8600 + dma` | sound path, every VBL (0 YM, 1 STE DMA) |
+| `$FB8600 + cap` | sound capability, every VBL: bit 0 STE DMA (else YM), bit 1 a TT (see "TT speaker") |
 | `$FB8C00 + len - 320` | STE DMA sound: the bytes the chip eats per VBL, as measured (every VBL) |
 | `$FB9000 + mono` | display, every VBL (1 = ST high res) |
 

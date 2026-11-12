@@ -125,20 +125,44 @@ static void menu_sort(void) {
 
 /* The menu is one flat list, as in MD/Lynx: the settings rows on top,
  * then -- when there are videos -- a blank, unselectable row, then the
- * videos. The selection is simply a row. */
+ * videos. The selection is simply a row. TT SPEAKER is there on a TT
+ * only (see sync_tt). */
 #define ROW_EXIT 0
 #define ROW_ABOUT 1
-#define ROW_SETTINGS 2
+#define ROW_SPEAKER 2
 
 /* Each setting reads the way MiSTer's do: its name on the left and its
  * value, if it has one, right-aligned against the far edge. */
-static const char *const SettingsLabel[ROW_SETTINGS] = {"EXIT TO GEM",
-                                                        "ABOUT"};
-static const char *const SettingsValue[ROW_SETTINGS] = {"", RELEASE_VERSION};
+static const char *const SettingsLabel[] = {"EXIT TO GEM", "ABOUT",
+                                            "TT SPEAKER"};
 
-static int first_video_row(void) { return ROW_SETTINGS + (s_count > 0); }
+static bool s_tt; /* the TT SPEAKER row is shown */
+
+static const char *settings_value(int row) {
+  switch (row) {
+    case ROW_ABOUT:
+      return RELEASE_VERSION;
+    case ROW_SPEAKER:
+      return audio_get_tt_speaker() ? "ON" : "OFF";
+    default:
+      return "";
+  }
+}
+
+static int settings_rows(void) { return ROW_SPEAKER + s_tt; }
+static int first_video_row(void) { return settings_rows() + (s_count > 0); }
 static int menu_rows_total(void) { return first_video_row() + s_count; }
-static bool row_is_gap(int row) { return s_count > 0 && row == ROW_SETTINGS; }
+static bool row_is_gap(int row) { return s_count > 0 && row == settings_rows(); }
+
+/* The m68k says it is a TT a VBL into its run, which can be after the
+ * menu has opened: the row then appears above the videos, and the
+ * selection moves down with them. */
+static void sync_tt(void) {
+  if (!s_tt && audio_has_tt_speaker()) {
+    s_tt = true;
+    if (s_row >= ROW_SPEAKER) s_row++;
+  }
+}
 
 /* Up or down one row, wrapping, and over the gap (never at either end). */
 static void ui_move(int dir) {
@@ -279,18 +303,18 @@ static void draw_menu(const struct menu_style *st) {
       pen = st->bg;
     }
 
-    if (row >= ROW_SETTINGS) {
+    if (row >= first_video_row()) {
       display_name(s_names[row - first_video_row()], line, sizeof(line));
       text_px(MENU_TEXT_X, y, pen, line, FONT_ALIGN_LEFT);
     } else {
       text_px(MENU_TEXT_X, y, pen, SettingsLabel[row], FONT_ALIGN_LEFT);
-      text_px(MENU_TEXT_R, y, pen, SettingsValue[row], FONT_ALIGN_RIGHT);
+      text_px(MENU_TEXT_R, y, pen, settings_value(row), FONT_ALIGN_RIGHT);
     }
   }
 
   if (s_count == 0) {
-    menu_centred(st, ROW_SETTINGS + 1, "NO .AVI FILES");
-    menu_centred(st, ROW_SETTINGS + 2, s_home);
+    menu_centred(st, settings_rows() + 1, "NO .AVI FILES");
+    menu_centred(st, settings_rows() + 2, s_home);
   }
 }
 
@@ -324,6 +348,7 @@ static void draw_about(const struct menu_style *st) {
 }
 
 static void draw(const struct menu_style *st) {
+  sync_tt();
   if (s_about) {
     draw_about(st);
   } else {
@@ -366,6 +391,7 @@ int mjpeg_menu_key(uint8_t scancode) {
     s_about = false;
     return MJPEG_MENU_NONE;
   }
+  sync_tt();
   switch (scancode) {
     case ST_SC_UP:
       ui_move(-1);
@@ -373,12 +399,20 @@ int mjpeg_menu_key(uint8_t scancode) {
     case ST_SC_DOWN:
       ui_move(1);
       break;
+    case ST_SC_LEFT:
+    case ST_SC_RIGHT:
+      if (s_tt && s_row == ROW_SPEAKER) {
+        audio_set_tt_speaker(scancode == ST_SC_RIGHT);
+      }
+      break;
     case ST_SC_RETURN:
     case ST_SC_KP_ENTER:
     case ST_SC_SPACE:
-      if (s_row >= ROW_SETTINGS) return s_row - first_video_row();
+      if (s_row >= first_video_row()) return s_row - first_video_row();
       if (s_row == ROW_ABOUT) {
         s_about = true;
+      } else if (s_row == ROW_SPEAKER) {
+        audio_set_tt_speaker(!audio_get_tt_speaker());
       } else {
         ikbd_request_boot_gem(); /* ROW_EXIT */
       }
