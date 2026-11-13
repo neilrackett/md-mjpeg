@@ -53,6 +53,19 @@
  * res on a mono monitor (VIDEO_WINDOW_BASE in userfw.s). */
 #define FB_VIDEO_HIBYTE     0x9000u
 #define FB_VIDEO_HIMASK     0xFF00u
+/* 256 colours (cart_shared.h): the display report's bit 1 says eight
+ * planes and bit 2 a Falcon's palette; the m68k acks each part it has
+ * copied at $FB9200 + the part's sequence number, low byte
+ * (PARTACK_WINDOW_BASE in userfw.s), and reports the rows of a part it
+ * copies in a VBL at $FB9400 + that (ROWS_WINDOW_BASE). */
+#define FB_REPORT_EIGHT     0x02u
+#define FB_REPORT_FALCON    0x04u
+#define FB_PARTACK_HIBYTE   0x9200u
+#define FB_ROWS_HIBYTE      0x9400u
+/* A part's ack takes as many VBLs as the m68k needs to copy 100 rows
+ * (two on a real TT); this is only for an m68k that has stopped, or
+ * gone back to GEM. */
+#define FB_PART_TIMEOUT_US  500000u
 /* Safety net only: must comfortably exceed the worst-case latency from
  * "counter bumped" to "m68k VBLSYNC" (up to ~2 VBLs = 40 ms when c2p
  * overruns the slack and the m68k skips a frame). Firing early would
@@ -63,6 +76,10 @@
 static volatile uint32_t s_vbl_seen;
 static uint32_t s_vbl_published;
 static volatile bool s_st_mono;
+static volatile bool s_st_eight, s_st_falcon; /* latched */
+static volatile uint8_t s_part_acked;         /* the last part ack's sequence byte */
+static volatile uint32_t s_part_acks;         /* how many part acks so far */
+static volatile uint8_t s_rows_per_vbl;
 
 /* Demo sprite. Multi-colour 16x16 ball with a transparent
  * background (key = 0xFF; transparent corners give it a rounded look
@@ -280,6 +297,18 @@ static void fb_rom3_dispatch(uint16_t sample) {
   if ((sample & FB_VIDEO_HIMASK) == FB_VIDEO_HIBYTE) {
     s_st_mono = (sample & 1u) != 0u;
     audio_set_mono(s_st_mono);
+    if ((sample & FB_REPORT_EIGHT) && !s_st_eight) {
+      s_st_falcon = (sample & FB_REPORT_FALCON) != 0u;
+      s_st_eight = true;
+      DPRINTF("fb: 256 colours (%s)\n", s_st_falcon ? "Falcon" : "TT Low");
+    }
+  }
+  if ((sample & FB_VIDEO_HIMASK) == FB_PARTACK_HIBYTE) {
+    s_part_acked = (uint8_t)sample;
+    s_part_acks++;
+  }
+  if ((sample & FB_VIDEO_HIMASK) == FB_ROWS_HIBYTE) {
+    s_rows_per_vbl = (uint8_t)sample;
   }
   /* Sound-capability report (userfw.s emits it each VBL at
    * SNDCAP_WINDOW_BASE + UFW_SNDCAP). Bit 0 picks the audio back-end so
@@ -295,9 +324,167 @@ static void fb_rom3_dispatch(uint16_t sample) {
   }
 }
 
-void fb_pump_rom3(void) { commemul_poll(fb_rom3_dispatch); }
+static void fb_eight_part1(bool block);
+
+void fb_pump_rom3(void) {
+  commemul_poll(fb_rom3_dispatch);
+  /* 256 colours: the last frame's bottom half, as soon as the m68k has
+   * copied its top (fb_eight_publish). */
+  fb_eight_part1(false);
+}
 
 bool fb_st_mono(void) { return s_st_mono; }
+
+bool fb_st_eight(void) { return s_st_eight; }
+
+bool fb_st_falcon(void) { return s_st_falcon; }
+
+unsigned fb_eight_rows_per_vbl(void) { return s_rows_per_vbl; }
+
+/* --- 256 colours ----------------------------------------------------
+ * See cart_shared.h. Ported from MD/DOOM. The picture goes in two parts
+ * of 100 rows, each filling the cart FB; the m68k copies a part and acks
+ * it, and only then is the FB written again. */
+_Static_assert((CART_PAL8_OFFSET & 3) == 0 &&
+                   CART_PAL8_OFFSET + CART_PAL8_SIZE <= CART_FRAMEBUFFER_OFFSET,
+               "the 8-plane palette is not in APP_FREE, aligned");
+_Static_assert((CART_PART_SEQ_OFFSET & 3) == 0 &&
+                   CART_PART_IDX_OFFSET == CART_PART_SEQ_OFFSET + 2,
+               "the part sequence and index share slot 3");
+_Static_assert(CART_PAL8_SEQ_OFFSET < CART_PALETTE_OFFSET,
+               "the 8-plane palette sequence is in the 16-colour palette");
+
+/* One entry in the format the ST in front of us takes, from 8-bit RGB: a
+ * TT's 0000RRRR GGGGBBBB, or a Falcon's RRRRRR00 GGGGGG00 00000000
+ * BBBBBB00. */
+static uint32_t fb_eight_colour(uint8_t r, uint8_t g, uint8_t b) {
+  if (s_st_falcon) {
+    const uint32_t r6 = (r * 63u + 127u) / 255u, g6 = (g * 63u + 127u) / 255u,
+                   b6 = (b * 63u + 127u) / 255u;
+    return (r6 << 26) | (g6 << 18) | (b6 << 2);
+  }
+  const uint32_t r4 = (r * 15u + 127u) / 255u, g4 = (g * 15u + 127u) / 255u,
+                 b4 = (b * 15u + 127u) / 255u;
+  return (r4 << 8) | (g4 << 4) | b4;
+}
+
+/* The palette, edited in place in the cart (cart_shared.h): the m68k
+ * only reads it when it starts a part 0, and every call here comes after
+ * the last frame's part 1 has gone and before the next one's part 0.
+ * Sent -- the sequence bumped -- with part 0 when anything in it has
+ * changed. */
+static bool s_pal8_dirty = true;
+
+static void fb_eight_put(unsigned idx, uint32_t v) {
+  volatile uint16_t *pal =
+      (volatile uint16_t *)((uintptr_t)&__rom_in_ram_start__ + CART_PAL8_OFFSET);
+  if (s_st_falcon) {
+    /* A long as two words, high first: uint16 writes are what cross the
+     * cart bus as they are. */
+    if (pal[2u * idx] != (uint16_t)(v >> 16) || pal[2u * idx + 1u] != (uint16_t)v) {
+      pal[2u * idx] = (uint16_t)(v >> 16);
+      pal[2u * idx + 1u] = (uint16_t)v;
+      s_pal8_dirty = true;
+    }
+  } else if (pal[idx] != (uint16_t)v) {
+    pal[idx] = (uint16_t)v;
+    s_pal8_dirty = true;
+  }
+}
+
+void fb_eight_set_colour(unsigned idx, uint8_t r, uint8_t g, uint8_t b) {
+  if (s_st_eight && idx >= CART_PALETTE_ENTRIES && idx < CART_PAL8_ENTRIES) {
+    /* Not while a part 0 waits to be latched with the palette as it is:
+     * once part 1 has gone, it has been (fb_eight_publish). */
+    fb_eight_part1(true);
+    fb_eight_put(idx, fb_eight_colour(r, g, b));
+  }
+}
+
+/* Entries 0..15 from palette_set's 16 ST words. An STE colour nibble
+ * keeps its lowest bit in bit 3. */
+static void fb_eight_st_palette(void) {
+  const volatile uint16_t *pal = (const volatile uint16_t *)(
+      (uintptr_t)&__rom_in_ram_start__ + CART_PALETTE_OFFSET);
+  for (unsigned i = 0; i < CART_PALETTE_ENTRIES; i++) {
+    uint8_t c[3];
+    for (unsigned k = 0; k < 3u; k++) {
+      const unsigned n = (pal[i] >> (8u - 4u * k)) & 15u;
+      c[k] = (uint8_t)((((n & 7u) << 1) | (n >> 3)) * 17u);
+    }
+    fb_eight_put(i, fb_eight_colour(c[0], c[1], c[2]));
+  }
+}
+
+static uint16_t s_part_seq, s_pal8_seq;
+static bool s_part_out; /* a part posted, its ack not yet seen */
+static uint32_t s_part_acks_at_post;
+static bool s_part1_due; /* part 0 posted, part 1 still to send */
+
+/* The m68k has copied the part last posted (or there is none). */
+static bool fb_eight_acked(void) {
+  return !s_part_out ||
+         (s_part_acks != s_part_acks_at_post && s_part_acked == (uint8_t)s_part_seq);
+}
+
+/* Until the m68k has copied the part last posted. */
+static void fb_eight_wait(void) {
+  if (!s_part_out) return;
+  const uint32_t t0 = time_us_32();
+  fb_pump_rom3();
+  while (!fb_eight_acked()) {
+    fb_pump_rom3();
+    if (time_us_32() - t0 > FB_PART_TIMEOUT_US) break;
+  }
+  s_part_out = false;
+}
+
+/* One part into the cart FB, the palette with part 0 if it has changed;
+ * returns the conversion's time. */
+static uint32_t fb_eight_part(unsigned part) {
+  fb_eight_wait();
+  uint8_t *cart = (uint8_t *)&__rom_in_ram_start__;
+  if (part == 0u && s_pal8_dirty) {
+    *(volatile uint16_t *)(cart + CART_PAL8_SEQ_OFFSET) = ++s_pal8_seq;
+    s_pal8_dirty = false;
+  }
+  const uint32_t t0 = time_us_32();
+  fb_c2p8_part((uint16_t *)fb_screen.framebuffer, part);
+  const uint32_t us = time_us_32() - t0;
+  /* The sequence last: the m68k takes the part, and the palette, when
+   * it sees it change. */
+  *(volatile uint16_t *)(cart + CART_PART_IDX_OFFSET) = (uint16_t)part;
+  __sync_synchronize();
+  *(volatile uint16_t *)(cart + CART_PART_SEQ_OFFSET) = ++s_part_seq;
+  s_part_acks_at_post = s_part_acks;
+  s_part_out = true;
+  return us;
+}
+
+/* Part 1, if it is still to send: once part 0's ack is in, or, with
+ * `block`, after waiting for it. */
+static void fb_eight_part1(bool block) {
+  if (!s_part1_due || (!block && !fb_eight_acked())) return;
+  s_part1_due = false; /* first: the wait in fb_eight_part pumps the ring, which comes back here */
+  last_convert_us += fb_eight_part(1u);
+}
+
+/* Part 0 only: part 1 goes from fb_pump_rom3 once the m68k has copied
+ * part 0, so the next frame's decode overlaps that copy (~30 ms on a real
+ * TT, a third of a frame) instead of fb_publish waiting it out. Rows
+ * 100..199 of the chunked buffer are the frame's until then, which
+ * fb_publish_wait_rows guards. */
+static void fb_eight_publish(void) {
+  fb_eight_part1(true); /* the last frame's, if it hasn't gone */
+  fb_eight_st_palette();
+  last_convert_us = fb_eight_part(0u);
+  s_part1_due = true;
+  fb_frame_tick++;
+}
+
+void fb_publish_wait_rows(unsigned y_end) {
+  if (y_end > CART_EIGHT_ROWS) fb_eight_part1(true);
+}
 
 /* fb_publish()'s ST high res levels: the pens an even grey ramp, pen p
  * round(16 * p / 15) -- 0 all ink, 15 all paper. */
@@ -307,6 +494,11 @@ static const uint8_t fb_mono_ramp[16] = {0, 1, 2,  3,  4,  5,  6,  7,
 void fb_publish(void) { fb_publish_levels(fb_mono_ramp); }
 
 void fb_publish_levels(const uint8_t levels[16]) {
+  if (s_st_eight) {
+    fb_eight_publish();
+    return;
+  }
+
   /* 1. Transpose chunked -> planar SCRATCH (RP RAM, dual-core). This is
    *    the slow part (~1 ms) but it does NOT touch the cart FB, so it
    *    runs unsynchronized and overlaps the m68k's blit of the previous

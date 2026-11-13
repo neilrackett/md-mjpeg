@@ -10,7 +10,9 @@
     "ST",
     "STE",
     "MegaST",
-    "MegaSTE"
+    "MegaSTE",
+    "TT",
+    "Falcon"
   ],
   "binary": "https://downloads.neilrackett.com/md-mjpeg/<APP_UUID>.uf2",
   "md5": "<BINARY_MD5_HASH>",

@@ -32,6 +32,7 @@
 #include "debug.h"
 #include "fb.h"
 #include "fb_blit.h"
+#include "fb_chunked.h"
 #include "fb_font.h"
 #include "ff.h"
 #include "ikbd.h"
@@ -77,6 +78,16 @@ int mjpeg_jpeg_init(JPEGIMAGE *pJPEG);
 /* Prime ~0.5 s (YM) / ~0.12 s (DMA) before starting so the ring never
  * runs dry between interleave chunks. Must stay below ARING_SIZE. */
 #define ARING_PREFILL 3072u
+/* In 256 colours a frame also waits for the m68k to copy the first half
+ * of the picture before the second can go (fb_publish, up to ~38 ms on
+ * a real TT, by MD/DOOM's figures), so the decode can hold off the
+ * demuxer for ~120 ms -- all of the prefill's lead. And a ring that runs
+ * dry is never made up: the clock counts the silence as time, so the
+ * audio falls behind the video for good, and ~250 ms of it leaves every
+ * frame late and the picture frozen. So there the ring is twice the
+ * size, in the scratch the 256-colour tables leave (mq_eight_spare). */
+#define ARING_SIZE_EIGHT 8192u
+#define ARING_PREFILL_EIGHT 7168u
 
 /* Skip (rather than decode) a due video frame once we are this many
  * frames behind the audio clock. */
@@ -132,11 +143,16 @@ static uint32_t s_frame_offsets[SEEK_RING]; /* frame index -> file offset */
 
 static uint32_t s_frames_shown, s_frames_skipped;
 static uint32_t s_decode_us; /* last decode cost, for the stats line */
+static uint32_t s_quant_us;  /* and its palette cut (mq_frame_done) */
 
 /* PCM ring: Core 0 (the demuxer) pushes, the fill callback pops on Core
  * 1 (audio.c's refill interrupt). Single producer, single consumer;
- * resetting it takes audio_lock(). */
-static uint8_t aring[ARING_SIZE];
+ * resetting it takes audio_lock(). aring is aring_static, or in 256
+ * colours ARING_SIZE_EIGHT bytes of the scratch; aring_size is a power
+ * of two. Both are chosen by mjpeg_open before the fill can see them. */
+static uint8_t aring_static[ARING_SIZE];
+static uint8_t *aring = aring_static;
+static uint32_t aring_size = ARING_SIZE, aring_prefill = ARING_PREFILL;
 static volatile uint32_t aring_head, aring_tail; /* free-running; head - tail = fill */
 
 /* JPEGDEC state is ~18 KB. Placed in .uninitialized_data, which lands
@@ -164,7 +180,7 @@ static inline uint32_t aring_level(void) { return aring_head - aring_tail; }
 static inline uint8_t aring_pop(void) {
   uint8_t s = 0x80;
   if (aring_head != aring_tail) {
-    s = aring[aring_tail & (ARING_SIZE - 1u)];
+    s = aring[aring_tail & (aring_size - 1u)];
     aring_tail++;
   }
   return s;
@@ -230,9 +246,9 @@ static void mjpeg_audio_fill(uint8_t *buf, uint32_t bytes) {
 static uint32_t aring_push_file(uint32_t bytes) {
   uint32_t pushed = 0;
   while (bytes) {
-    uint32_t head = aring_head & (ARING_SIZE - 1u);
-    uint32_t lin = ARING_SIZE - head;
-    uint32_t space = ARING_SIZE - aring_level();
+    uint32_t head = aring_head & (aring_size - 1u);
+    uint32_t lin = aring_size - head;
+    uint32_t space = aring_size - aring_level();
     if (lin > space) lin = space;
     if (lin > bytes) lin = bytes;
     if (!lin) break;
@@ -342,7 +358,7 @@ static int avi_parse(void) {
 static void prefill_audio(void) {
   uint32_t pos = s_movi_start;
   uint32_t got = 0;
-  while (got < ARING_PREFILL && pos + 8 <= s_movi_end) {
+  while (got < aring_prefill && pos + 8 <= s_movi_end) {
     uint32_t fcc, size;
     if (rd_chunk_hdr(pos, &fcc, &size)) break;
     uint32_t data = pos + 8;
@@ -351,7 +367,7 @@ static void prefill_audio(void) {
       continue;
     }
     if (fcc == FCC_01WB && size) {
-      uint32_t want = ARING_PREFILL - got;
+      uint32_t want = aring_prefill - got;
       if (want > size) want = size;
       got += aring_push_file(want);
     }
@@ -424,9 +440,14 @@ static void decode_frame(uint32_t data, uint32_t size) {
   /* ST high res: luma only, which skips the chroma IDCT and colour
    * conversion, into grey pens instead of the colour quantizer. */
   const bool mono = fb_st_mono();
+  /* The quantizer took its colours from the display when the video
+   * opened. A video opened before the m68k's first report (a key it
+   * passed on in its first VBL, ahead of the report) gets 256 colours
+   * from the first frame after. */
+  if (!mono && fb_st_eight() != mq_eight()) mq_init();
   s_jpg.pfnRead = jpg_read;
   s_jpg.pfnSeek = jpg_seek;
-  s_jpg.pfnDraw = mono ? mq_draw_mono : mq_draw;
+  s_jpg.pfnDraw = mono ? mq_draw_mono : mq_eight() ? mq_draw8 : mq_draw;
   s_jpg.iMaxMCUs = 1000;
   s_jpg.JPEGFile.fHandle = &s_fil;
   s_jpg.JPEGFile.iSize = (int32_t)size;
@@ -445,7 +466,13 @@ static void decode_frame(uint32_t data, uint32_t size) {
     /* Publish whatever bands landed; better than a stall. */
   }
   s_decode_us = time_us_32() - t0;
+  /* 256 colours: the last frame's bottom half has gone (the decode sent
+   * it, unless it stopped short of row 100) before its palette is
+   * replaced or anything else drawn. */
+  fb_publish_wait_rows(FB_CHUNKED_H);
+  const uint32_t tq = time_us_32();
   if (!mono) mq_frame_done(); /* palette for the NEXT frame, from this frame */
+  s_quant_us = time_us_32() - tq;
   if (overlay_active()) draw_overlay();
   if (s_menu) mjpeg_menu_draw_over();
   fb_publish();    /* VBL-synced hand-off to the ST */
@@ -481,13 +508,19 @@ uint32_t mjpeg_frames_shown(void) { return s_frames_shown; }
 
 void mjpeg_debug_status(char *buf, int len) {
   /* A: audio refills since the last line (~150 in 3 s, ~214 in mono);
-   * L: their size, the DMA length the m68k has settled on. */
-  snprintf(buf, (size_t)len, "F%lu S%lu I%lu E%d R%lu D%luus A%lu L%lu",
-           (unsigned long)s_frames_shown, (unsigned long)s_frames_skipped,
-           (unsigned long)s_frame_index, s_jpg.iError,
-           (unsigned long)aring_level(), (unsigned long)s_decode_us,
-           (unsigned long)audio_take_fills(),
-           (unsigned long)audio_get_fill_bytes());
+   * L: their size, the DMA length the m68k has settled on; Q: the last
+   * frame's palette cut, after its decode (D). In 256 colours, B: the
+   * rows of a part the m68k copies a VBL (100 = a part a VBL, so a frame
+   * two; a real TT is nearer 75). */
+  int n = snprintf(buf, (size_t)len, "F%lu S%lu I%lu E%d R%lu D%luus Q%luus A%lu L%lu",
+                   (unsigned long)s_frames_shown, (unsigned long)s_frames_skipped,
+                   (unsigned long)s_frame_index, s_jpg.iError,
+                   (unsigned long)aring_level(), (unsigned long)s_decode_us,
+                   (unsigned long)s_quant_us, (unsigned long)audio_take_fills(),
+                   (unsigned long)audio_get_fill_bytes());
+  if (fb_st_eight() && n > 0 && n < len) {
+    snprintf(buf + n, (size_t)(len - n), " B%u", fb_eight_rows_per_vbl());
+  }
 }
 
 int mjpeg_open(const char *path) {
@@ -504,6 +537,19 @@ int mjpeg_open(const char *path) {
     return -2;
   }
   mq_init();
+  /* 256 colours: the deeper ring (see ARING_SIZE_EIGHT). Nothing reads
+   * the ring while closed, so it can change here. */
+  uint32_t spare = 0;
+  uint8_t *deep = mq_eight_spare(&spare);
+  if (deep && spare >= ARING_SIZE_EIGHT) {
+    aring = deep;
+    aring_size = ARING_SIZE_EIGHT;
+    aring_prefill = ARING_PREFILL_EIGHT;
+  } else {
+    aring = aring_static;
+    aring_size = ARING_SIZE;
+    aring_prefill = ARING_PREFILL;
+  }
   s_pos = s_movi_start;
   s_audio_left = 0;
   s_audio_skip = 0;
@@ -554,7 +600,7 @@ bool mjpeg_tick(void) {
   for (;;) {
     /* Finish draining a partially-consumed audio chunk first. */
     if (s_audio_left) {
-      if (aring_level() >= ARING_SIZE) return true; /* ring full; later */
+      if (aring_level() >= aring_size) return true; /* ring full; later */
       if (f_lseek(&s_fil, s_audio_pos) != FR_OK) {
         return false; /* read error -> treat as end */
       }
@@ -696,6 +742,7 @@ void mjpeg_render_paused(void) {
   /* The chunked buffer still holds the last decoded frame (nothing
    * overwrites it while paused); draw the overlay over it and republish
    * at VBL rate. Idempotent -- the boxes redraw over the same pixels. */
+  fb_publish_wait_rows(FB_CHUNKED_H);
   draw_overlay();
   if (s_menu) mjpeg_menu_draw_over();
   fb_publish();

@@ -32,6 +32,9 @@
 #ifndef MJPEG_QUANT_H_INCLUDED
 #define MJPEG_QUANT_H_INCLUDED
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "JPEGDEC.h"
 
 #ifdef __cplusplus
@@ -53,6 +56,21 @@ int mq_draw(JPEGDRAW *pDraw);
  * in mono -- and calls mjpeg_service(). No histogram or palette:
  * nothing reads the palette in mono. */
 int mq_draw_mono(JPEGDRAW *pDraw);
+
+/* 256 colours (a TT or a Falcon, fb_st_eight): true when mq_init chose
+ * them, and then mq_draw8 is the draw callback. It dithers to RGB444,
+ * counts a 4096-bin histogram and maps each pixel to one of the frame's
+ * 240 colours (palette indices 16..255; 0..15 are a grey ramp, black to
+ * white, for the overlay and the menu). mq_frame_done median-cuts the
+ * histogram into the next frame's 240, and mq_republish does nothing:
+ * pens 0 and 15 are black and white already. See mjpeg_quant.c. */
+bool mq_eight(void);
+int mq_draw8(JPEGDRAW *pDraw);
+
+/* 256 colours: the part of fb_eight_scratch() the tables leave free, 4-byte
+ * aligned, its size in `bytes` (about 11 KB). NULL and 0 unless
+ * mq_eight(). Valid until the next mq_init. */
+uint8_t *mq_eight_spare(uint32_t *bytes);
 
 /* Publish the palette and rebuild the map again, now: for when the menu
  * opens or closes over the video (while it is shown, entry 15 is held at

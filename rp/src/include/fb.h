@@ -113,9 +113,41 @@ bool fb_st_mono(void);
  *         as an even grey ramp, 0 black to 15 white. */
 void fb_publish_levels(const uint8_t levels[16]);
 
+/* --- 256 colours (cart_shared.h, "256 colours") ----------------------
+ * True when the ST is a TT or a Falcon showing 8 interleaved bitplanes,
+ * 320x200, from the same display report as fb_st_mono(); fb_st_falcon()
+ * says which palette format. Latched: the m68k decides it once, at boot.
+ * The pixels of fb_chunked_buffer are then palette indices 0..255 as
+ * they are, and fb_publish() sends them in two parts of 100 rows. It
+ * returns once the first is posted; the second goes from fb_pump_rom3()
+ * when the m68k has copied the first (about two VBLs on a real TT), so
+ * the next frame can be decoded meanwhile -- see fb_publish_wait_rows. */
+bool fb_st_eight(void);
+bool fb_st_falcon(void);
+
+/* Before drawing into any row of fb_chunked_buffer below `y_end`: in 256
+ * colours rows 100..199 may still be the last frame's, waiting to be sent
+ * (see fb_st_eight), and this sends them first, waiting for the m68k if
+ * it must. Returns at once when there's nothing outstanding, which
+ * outside 256 colours is always. FB_CHUNKED_H covers the whole buffer;
+ * call it with that before anything but a top-down decode draws. */
+void fb_publish_wait_rows(unsigned y_end);
+
+/* The 256-colour palette, from 8-bit RGB, in effect from the next
+ * fb_publish(). Entries 0..15 are not set here: they follow palette_set's
+ * 16 ST colours, so that the 16-colour menu, the time overlay and the
+ * boot screen draw the same in both modes. Ignored for an index below 16
+ * or before fb_st_eight(). */
+void fb_eight_set_colour(unsigned idx, uint8_t r, uint8_t g, uint8_t b);
+
+/* Debug: the rows of a part the m68k copies in a VBL, as it measured at
+ * boot (100 or more means a part a VBL; 0 before the first report). */
+unsigned fb_eight_rows_per_vbl(void);
+
 /** @brief Microseconds the most recent fb_publish() spent in the
  *         chunky-to-planar conversion (dual-core c2p + chunk-reversed
- *         memcpy). Updated every fb_publish(); stale-by-one is fine
+ *         memcpy; in 256 colours both parts' conversions, without the
+ *         waits). Updated every fb_publish(); stale-by-one is fine
  *         for an on-screen timing readout. */
 uint32_t fb_last_convert_us(void);
 

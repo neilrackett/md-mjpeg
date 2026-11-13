@@ -46,8 +46,13 @@
  *   $FA4100  AUDIO_BUFFER          1 KB (see below)
  *   $FA4500  SPEAKER               2 B  (TT internal speaker on/off, see
  *                                        CART_SPEAKER_OFFSET)
- *   $FA4502  APP_FREE           ~15.5 KB free arena, ends at FRAMEBUFFER
- *   $FA8300  FRAMEBUFFER          32 KB (320x200 4 bpp low-res)
+ *   $FA4502  APP_FREE           ~15.5 KB free arena, ends at FRAMEBUFFER;
+ *                                        its first 1 KB from $FA4504 is
+ *                                        the 256-colour palette (see "256
+ *                                        colours")
+ *   $FA8300  FRAMEBUFFER          32 KB (320x200 4 bpp low-res; in 256
+ *                                        colours, half the picture at a
+ *                                        time -- see "256 colours")
  *   $FAFFFF  end of region
  */
 #define CART_CARTRIDGE_CODE_SIZE         0x4000  /* 16 KB cart-image budget */
@@ -94,6 +99,45 @@
 
 /* APP_FREE arena starts after the speaker word. */
 #define CART_APP_FREE_OFFSET (CART_SPEAKER_OFFSET + 2)
+
+/* --- 256 colours: a TT's TT Low or a Falcon's 8-plane mode ----------
+ * (ported from MD/DOOM)
+ *
+ * When the display report says so (fb_st_eight), the picture is 320x200
+ * in 8 interleaved bitplanes: 64,000 bytes, twice the cart FB. It
+ * crosses in two parts of 100 rows, each exactly the 32,000-byte FB,
+ * row-major and in natural order (no chunk reversal: the m68k's copy
+ * runs forwards); a row is 20 groups of 16 pixels, each 8 plane words,
+ * plane 0 first, leftmost pixel in bit 15.
+ *
+ * Slot 3: the RP writes the part (+2: 0 = rows 0..99, 1 = 100..199),
+ * then bumps the sequence word (+0) last, once the part is in the FB.
+ * The m68k copies a part when the sequence changes and acks it by
+ * reading PARTACK_WINDOW_BASE + the sequence's low byte; only then may
+ * the RP write the FB again. It repeats that ack every VBL until the
+ * next part, so one lost to a lapped capture ring is not waited on. The
+ * page goes on screen once part 1 is in.
+ *
+ * Slot 4: bumped when the palette below has changed; the m68k latches it
+ * as it starts a part 0 and applies it when that frame goes on screen.
+ * The RP writes the palette in place, between publishes -- never while a
+ * part 0 is waiting to be latched -- and bumps this with part 0. 256
+ * entries at the start of APP_FREE, 4-byte aligned, in the palette
+ * registers' own format, so the m68k only copies them:
+ *   TT:     256 words, 0000RRRR GGGGBBBB, for $FF8400.
+ *   Falcon: 256 longs, RRRRRR00 GGGGGG00 00000000 BBBBBB00, for $FF9800.
+ *           (MD/DOOM squeezes these into words, which leaves blue four
+ *           bits; white then has a yellow cast.)
+ * Mirrored as PART_SEQ_ADDR, PART_IDX_ADDR, PAL8_SEQ_ADDR and PAL8_ADDR
+ * in userfw.s. */
+#define CART_PART_SEQ_OFFSET             (CART_SHARED_VARIABLES_OFFSET + 12)
+#define CART_PART_IDX_OFFSET             (CART_SHARED_VARIABLES_OFFSET + 14)
+#define CART_PAL8_SEQ_OFFSET             (CART_SHARED_VARIABLES_OFFSET + 16)
+#define CART_PAL8_OFFSET                 (CART_APP_FREE_OFFSET + 2) /* $4504 */
+#define CART_PAL8_ENTRIES                256
+#define CART_PAL8_SIZE                   (CART_PAL8_ENTRIES * 4) /* a Falcon's */
+#define CART_EIGHT_ROWS                  100 /* rows a part */
+#define CART_EIGHT_ROW_BYTES             320
 
 /* Framebuffer sized for low-res 4 bpp (320 x 200 = 32000 bytes). Sits
  * flush against the top of the 64 KB region: end = $FB0000 exactly,

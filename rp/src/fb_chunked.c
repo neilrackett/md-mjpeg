@@ -192,6 +192,72 @@ void __not_in_flash_func(fb_planar_publish)(uint16_t *planar) {
          CART_FB_CHUNK_TAIL);
 }
 
+/* --- 256 colours ---------------------------------------------------- */
+
+uint8_t *fb_eight_scratch(void) { return (uint8_t *)fb_planar_scratch; }
+
+/* Plane k's four bits for the four pixels of q, pixel 0 (the low byte)
+ * in the nibble's top bit: the 4-plane conversion's trick, run for all
+ * eight planes. The multiply puts each pixel's bit in its own place, so
+ * nothing carries. (From MD/DOOM.) */
+#define FB_NIB(q, k) (((((q) >> (k)) & 0x01010101u) * 0x80402010u) >> 28)
+
+/* The chunked buffer read four pixels at a time: rows are 320 bytes and
+ * the buffer is 4-aligned, so every group of 16 is too. */
+typedef uint32_t __attribute__((may_alias)) fb_u32_alias_t;
+
+/* `rows` rows of 320 palette indices from `src` to 8 interleaved planes
+ * at `dst`, stored as little-endian uint32 pairs so that the cart bus
+ * presents them to the m68k in plane order. In RAM, but at Os rather
+ * than this file's O3, which unrolls it to ~1 KB: RAM code shares the
+ * hole below .bss with s_jpg (AGENTS.md, lesson 4), and a part takes
+ * about a millisecond against the m68k's ~33 ms to copy one. */
+static void __attribute__((optimize("Os"))) __not_in_flash_func(fb_c2p8_rows)(
+    uint32_t *dst, const uint8_t *src, unsigned rows) {
+  const fb_u32_alias_t *s = (const fb_u32_alias_t *)src;
+  for (unsigned n = rows * (FB_CHUNKED_W / 16u); n; n--) {
+    uint32_t p01 = 0, p23 = 0, p45 = 0, p67 = 0;
+    for (unsigned g = 0; g < 4u; g++) {
+      const uint32_t q = *s++;
+      const unsigned sh = 12u - 4u * g;
+      p01 |= (FB_NIB(q, 0) << sh) | (FB_NIB(q, 1) << (sh + 16u));
+      p23 |= (FB_NIB(q, 2) << sh) | (FB_NIB(q, 3) << (sh + 16u));
+      p45 |= (FB_NIB(q, 4) << sh) | (FB_NIB(q, 5) << (sh + 16u));
+      p67 |= (FB_NIB(q, 6) << sh) | (FB_NIB(q, 7) << (sh + 16u));
+    }
+    dst[0] = p01;
+    dst[1] = p23;
+    dst[2] = p45;
+    dst[3] = p67;
+    dst += 4;
+  }
+}
+
+_Static_assert(CART_EIGHT_ROWS * CART_EIGHT_ROW_BYTES == CART_FRAMEBUFFER_SIZE,
+               "a 256-colour part is not the cart FB");
+_Static_assert(2 * CART_EIGHT_ROWS == FB_CHUNKED_H,
+               "two 256-colour parts are not the picture");
+
+#define FB_C2P8_HALF (CART_EIGHT_ROWS / 2u)
+
+static uint16_t *s_c2p8_dst;
+
+/* Core 1's share of a part: its second 50 rows. */
+static void __not_in_flash_func(fb_c2p8_job)(void *arg) {
+  const unsigned part = (unsigned)(uintptr_t)arg;
+  fb_c2p8_rows((uint32_t *)s_c2p8_dst + FB_C2P8_HALF * (CART_EIGHT_ROW_BYTES / 4u),
+               fb_chunked_buffer + (part * CART_EIGHT_ROWS + FB_C2P8_HALF) * FB_CHUNKED_W,
+               FB_C2P8_HALF);
+}
+
+void fb_c2p8_part(uint16_t *cart_fb, unsigned part) {
+  s_c2p8_dst = cart_fb; /* the dispatch's FIFO push orders it for Core 1 */
+  fb_core1_dispatch(fb_c2p8_job, (void *)(uintptr_t)part);
+  fb_c2p8_rows((uint32_t *)cart_fb,
+               fb_chunked_buffer + part * CART_EIGHT_ROWS * FB_CHUNKED_W, FB_C2P8_HALF);
+  fb_core1_wait();
+}
+
 void __not_in_flash_func(fb_chunky_to_planar)(uint16_t *planar) {
   /* Convenience wrapper: transpose then publish in one call (no VBL
    * sync). fb.c's fb_publish() calls the two halves separately so the

@@ -10,7 +10,7 @@ MD/MJPEG turns your SidecarTridge Multi-device into a video player for your Atar
 
 Why? Because why watch videos at 4K resolution in 16.7 million colours when you can watch them at 0.3K in 16!
 
-Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut, blue-noise dither and a saturation boost, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. Sound is 8-bit 25 kHz DMA audio on an STE, or the YM2149 (~5.6 kHz) on a plain ST — the firmware detects which machine it's on and picks the best it can do. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
+Every frame is decoded from MJPEG on the SidecarT's RP2040, quantized to a fresh 16-colour palette (median cut, blue-noise dither and a saturation boost, so each frame gets the best colours the ST can show), and blitted to the screen over the cartridge port at up to 25 fps. On a TT or a Falcon with a colour monitor it plays in 256 colours instead, each frame with 240 of its own picked from the TT's 4,096 or the Falcon's 262,144, in TT Low or the Falcon's 8-bit mode. Sound is 8-bit 25 kHz DMA audio on an STE, or the YM2149 (~5.6 kHz) on a plain ST — the firmware detects which machine it's on and picks the best it can do. Video and audio stay in sync by design: the audio clock paces the video, and busy scenes drop frames rather than drift.
 
 When it starts, the app lists the `.AVI` files in the `/mjpeg` folder of the SD card, below **About** and **Exit to GEM**. Use **Up/Down** to choose one and **Return** to play it. During playback, **Left/Right** skip back/forward 10 seconds and **Space** pauses and resumes (a time readout pops up briefly when you seek or pause). **ESC** opens the list over the video, which carries on playing underneath: pick another video, or press **ESC** again to go back to it. When a video reaches the end, the list opens over its last frame. From the list, **Exit to GEM** quits back to GEM, as does **ESC** when nothing is playing. On a TT, a **TT Speaker** setting turns the TT's internal speaker on or off (off by default; **Left/Right** or **Return** to change it); it goes back to how TOS had it when you exit.
 
@@ -67,6 +67,7 @@ EmuMD boots EmuTOS unless you give it another TOS image with `TOS=/path/to/tos.i
 ## Known limitations
 
 - On a mono monitor (ST high res) videos play in black and white, dithered to 640×400. This hasn't been tried on a real SM124 yet.
+- 256 colours on a TT or a Falcon is twice as much picture to get across the cartridge port, so expect around 12 frames a second on a TT rather than 25 (the sound isn't affected). It's been tried on a real TT, but not yet on a real Falcon.
 - Sound is mono. An STE plays 8-bit 25 kHz DMA audio; a plain ST falls back to the YM2149 (~5.6 kHz, effectively 6-bit — think telephone, not hi-fi).
 - Very busy scenes can exceed the per-frame decode budget; the player skips frames to keep the audio smooth and the picture in sync.
 - The menu lists up to 20 files.

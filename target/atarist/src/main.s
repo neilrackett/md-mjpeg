@@ -82,6 +82,13 @@ MONO_UI_BUFFER_SIZE	equ 8000
 ; budget ($2000..$3FFF). The CARTRIDGE_CODE_SIZE = 16 KB cap covers all.
 USERFW			equ (ROM4_ADDR + $800)				; $FA0800
 
+; Passed to userfw in D7: the top of the ST RAM that nothing owns above
+; $80000, where a TT or a Falcon puts its two 256-colour pages if they
+; fit (userfw.s, "256 colours"): the lower of _memtop and TOS's screen
+; (a Falcon's TOS 4.04 leaves _memtop at the top of RAM and its screen
+; below it, as md-xt found). From MD/DOOM.
+_memtop			equ $436
+
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
 PRE_RESET_WAIT		equ $FFFFF
 
@@ -341,6 +348,11 @@ start_rom_code:
 ; the user firmware: userfw owns the VBL loop and runs fbdrv (or, on
 ; STE-class machines, an inline blitter copy) which copies the cart FB
 ; to ST screen verbatim with the correct 4bpp planar interpretation.
+	move.l _memtop.w, d7		; the RAM above $80000 userfw may take
+	cmp.l a6, d7				; (A6: TOS's screen, from the start)
+	bls.s .top_set
+	move.l a6, d7
+.top_set:
 	jmp USERFW
 
 .reset:
@@ -368,6 +380,7 @@ boot_gem:
 ; the same way md-drives-emulator's rom_function dispatches into
 ; GEMDRIVE/FLOPPYEMUL/ACSIEMUL/RTCEMUL.
 rom_function:
+    moveq #0, d7				; no RAM for 256 colours (see _memtop)
     jmp USERFW
 
 ; Shared functions included at the end of the file

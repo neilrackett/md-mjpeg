@@ -20,13 +20,16 @@ boost), and blits it to the ST screen over the cartridge bus at up to 25 fps.
 Audio is universal: the firmware auto-detects STE DMA sound (25 kHz 8-bit)
 and falls back to YM2149 (~5.6 kHz) on a plain ST. On a mono monitor (ST
 high res) it plays in black and white instead: each frame decoded luma-only
-and dithered to 640×400 (see "ST high res" below). A/V sync is audio-master:
+and dithered to 640×400 (see "ST high res" below). On a TT or a Falcon with a
+colour monitor it plays in 256 colours: TT Low or the Falcon's 8-plane mode,
+each frame median-cut to 240 colours of its own (see "TT and Falcon: 256
+colours"). A/V sync is audio-master:
 the fill callback's sample clock paces video; when decoding falls ≥2 frames
 behind, frames are skipped so audio never stalls.
 
 Built from **md-framebuffer-template** (the framework does the heavy
 lifting): dual page-flipped framebuffer on the ST side, real VBL lock (50 Hz,
-or 71 Hz on a mono monitor),
+60 Hz on a TT's or a Falcon's VGA monitor, or 71 Hz on a mono monitor),
 chunky→planar conversion split across both cores, ~6 kHz YM audio, IKBD
 keyboard decoding. The template's demo suite was stripped out; the
 pristine pre-strip tree is in `rp.bak/` (gitignored) and the demos remain
@@ -39,7 +42,7 @@ Key app sources (all GPL-3.0-or-later, SPDX headers):
 | File | Role |
 | --- | --- |
 | `rp/src/mjpeg.c` / `include/mjpeg.h` | AVI demuxer, playback state machine, PCM ring, audio fill callback (Ghostbusters LUT), A/V clock |
-| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. |
+| `rp/src/mjpeg_quant.c` / `include/mjpeg_quant.h` | per-frame colour pipeline: dither LUTs, RGB333 histogram, median cut, 512-entry map, JPEGDEC draw callback. Palette entries are RGB444 published in STE encoding (`PALETTE_STE_RGB`) — a plain ST reads the RGB333 truncation of the same word, so one palette serves both with no detection. This is finer *placement* only; dither + histogram default to RGB333, so distinct-level count (esp. greyscale) is unchanged. `MQ_HIST=g4` upgrades green to 4-bit (RGB343, 1024 bins) for a real greyscale win at +1.5 KB; full RGB444 (4096 bins) is RAM-blocked (lesson 4) — see the histogram-depth flag below. In 256 colours (`mq_eight()`) a second quantizer runs instead, at RGB444, in RAM borrowed from the planar scratch — see "TT and Falcon: 256 colours". |
 | `rp/src/mjpeg_menu.c` / `include/mjpeg_menu.h` | the video menu, laid out like MD/Lynx's MiSTer-style OSD: a 30×16-cell box, navy and white on black, title strip reading upwards (▲/▼ when the list scrolls), ABOUT (version) and EXIT TO GEM above the videos (and, on a TT, TT SPEAKER: see "TT speaker"), the About page in the same box. Owns the selection; `mjpeg_menu_key()` hands `emul.c` a video to play, or `MJPEG_MENU_BACK` for ESC. ESC during playback draws the same box over the video (`mjpeg_show_menu()` → `mjpeg_menu_draw_over()` before each publish), and at the end of a video over its last frame (`mjpeg_finish()`: `mjpeg_menu_shown()` stays true, and `mjpeg_menu_render()` draws over the frame instead of clearing it) in the frame's pens 0 and 15: pen 0 is always black, and the quantizer holds 15 at white while `mjpeg_menu_shown()` (`mq_republish()` applies it at once) (published palette and map only — the hysteresis keeps the real colour; mono's grey ramp needs nothing). Holding the pens beats md-lynx's pick-the-extremes here: a video's palette is rebuilt every frame, so picked pens recolour the box with every scene and lose contrast in fades, and the quantizer re-maps pixels around held ones, so md-lynx's speckle problem doesn't arise. The video plays on underneath; closing it over a paused video re-decodes the frozen frame from the seek ring |
 | `rp/src/jpegdec_core.c` | instantiates `jpegdec/src/jpeg.inl` (bitbank2/JPEGDEC submodule, Apache-2.0) as plain C; exports `mjpeg_jpeg_init()` |
 | `rp/src/fb_mono.c` | ST high res: the chunked 320×200 pens as a 640×400 one-bit picture, doubled and blue-noise dithered (see "ST high res"); shared by the hardware and EmuMD builds |
@@ -199,6 +202,17 @@ How it is put together (`mdfw.ini`, `emu/`):
   pointer-to-`unsigned int` warnings (`main.c`'s debug dump, the
   config-offset maths in `gconfig.c`/`aconfig.c`) are harmless: only the
   low 32 bits of a difference are used.
+- A TT or a Falcon, for 256 colours: `--machine tt` (with TOS 3.06, or
+  EmuTOS 1.4's 512k image: the 256k one EmuMD downloads can't run a TT,
+  and Hatari quietly runs an STE) or `--machine falcon` (TOS 4.04) on
+  `mdfw run`, and `-- --monitor vga|rgb|mono` for the Falcon's monitor.
+  **Hatari shows a TT's or a Falcon's new page one frame early**: it draws
+  those screens whole at the VBL from the base as it stands (a TT's
+  reloaded three lines before; the VIDEL's read then), where the hardware
+  takes it at the start of the next frame, which is when the palette that
+  goes with it is applied. So in Hatari a frame can show for one VBL with
+  the last frame's palette. The entries are sorted by luminance, which
+  makes that near enough invisible; count it if you look at a recording.
 - What it cannot tell you: anything about time (the host is far faster, so
   the `D` decode times mean nothing and frames never skip), memory (the RAM ceiling,
   heap headroom and the `.uninitialized_data` hole are not modelled), races
@@ -217,6 +231,15 @@ Scripting it (what worked):
   the last key, or the run ends before the key lands. `command FIFO read
   error: Resource temporarily unavailable` lines are Hatari polling an empty
   fifo — harmless; filter them out of the log.
+- Run playback checks one at a time. Several fast-forwarded runs at once
+  can hold the RP's main thread off long enough, in ST time, to empty the
+  PCM ring, and then the picture freezes for good (`S` climbing, `R` full;
+  see Known issues). The 16-colour path's 4 KB ring goes first: four runs
+  side by side froze an STE.
+- A key sent the moment the main loop starts can reach the RP ahead of
+  the m68k's first display report: a video opened then starts in 16
+  colours and `decode_frame` moves it to 256 at its first frame (its PCM
+  ring stays 4 KB). Give it a second.
 - Screenshots and recordings include the ST border (palette entry 0, so
   black during playback): crop 832×528 (colour) or 640×400 (mono) to drop
   Hatari's status bar.
@@ -255,8 +278,10 @@ Things that cost real debugging time. Do not re-learn them.
    between `__bss_end__` and `0x20030000` (check the map after adding
    statics; FatFs LFN ops malloc ~0.5 KB each on top of settings). It has
    sat just under that since the menu and colour work: **19,144 B at
-   v1.1.0**, still well clear of the ~14 KB boot malloc — don't let it slide
-   further.
+   v1.1.0, 19,076 B at v1.2.0** (256 colours added almost nothing: its
+   tables and deeper PCM ring borrow the planar scratch, and its palette
+   lives in the cart region), still well clear of the ~14 KB boot malloc —
+   don't let it slide further.
 
 3. **`target_firmware[]` must be 4-byte aligned.** `COPY_FIRMWARE_TO_RAM`
    uses the RP2040 XIP-stream DMA, and `XIP_STREAM_ADDR` silently truncates
@@ -282,7 +307,11 @@ Things that cost real debugging time. Do not re-learn them.
    (~2.8 KB at v1.1.0: it ends at `0x200074F0`)** — the LUTs were pulled out to `.bss` when the menu's statics
    tipped the then-packed hole past the boundary (jumping `.bss` a full
    32 KB and overflowing RAM); see the `.uninitialized_data` note in
-   `mjpeg_quant.c`. Overflowing it is caught by the linker (`.bss will
+   `mjpeg_quant.c`. RAM-resident code (`__not_in_flash_func`) is `.data`,
+   so it eats this margin rather than the heap's: 256 colours' `mq_draw8`
+   (884 B at O3) and `fb_c2p8_rows` (220 B, built at Os for this reason —
+   O3 made it 956 B) took it to **~1.6 KB at v1.2.0 (ends at
+   `0x200079B0`)**. Overflowing it is caught by the linker (`.bss will
    not fit in region RAM`), NOT silent — but the build script still prints
    "Build completed successfully" on a failed RP link, so after any static
    growth verify `[100%] Built target rp` / `Linking ... rp.elf` appeared
@@ -301,10 +330,12 @@ Things that cost real debugging time. Do not re-learn them.
    ESC dead because IKBD forwarding runs inside the m68k blit loop). The
    layered diagnostics that finally worked: the UART `HB:` heartbeat (RP
    liveness, with the player counters `F` shown / `S` skipped / `I` index /
-   `E` last JPEG error / `R` ring bytes / `D` decode µs / `A` audio
-   refills / `L` refill bytes), the menu (the
-   version on its ABOUT row, the detected sound path on the About page —
-   m68k + fb path liveness) and the cart canary (region integrity). Keep
+   `E` last JPEG error / `R` ring bytes / `D` decode µs / `Q` the palette
+   cut after it, µs / `A` audio refills / `L` refill bytes / `B`, in 256
+   colours, rows a VBL), the
+   menu (the version on its ABOUT row, the detected sound path and picture
+   — 16 or 256 colours, or mono — on the About page: m68k + fb path
+   liveness) and the cart canary (region integrity). Keep
    them. (An on-screen stall screen that painted the counters went with the
    menu work in `9cdfdbc`; the heartbeat carries them now.)
 
@@ -324,7 +355,16 @@ Things that cost real debugging time. Do not re-learn them.
    0`, ~100 ms chunks), which is what lets the ring be back at **4 KB with
    3 KB prefill** (`ARING_SIZE`/`ARING_PREFILL`) — files muxed the old way
    may underrun. `mjpeg_open()` pre-scans movi to prime the ring, then skips
-   those bytes inline.
+   those bytes inline. In 256 colours `decode_frame` can also wait for the
+   m68k to copy half the picture (up to ~38 ms on a real TT, when the
+   decode reaches row 100 first) and runs the 240-colour cut (~8 ms),
+   ~120 ms in all at q7 against the prefill's ~123 ms lead, so there the ring is
+   **8 KB with 7 KB prefill** (`ARING_SIZE_EIGHT`), in the scratch the
+   256-colour tables leave (`mq_eight_spare()`). An underrun matters more
+   than a dropout: the clock counts the silence as time, so the audio
+   falls behind the video for good, and once that passes the ring plus
+   two frames (~250 ms with 4 KB) every frame is late and the picture
+   freezes while the sound plays on (see Known issues).
 
 9. **JPEGDEC as plain C**: `jpeg.inl` compiles as C when `JPEGDEC.h` sees a
    non-Arduino platform macro — we define `__MCUXPRESSO` scoped to the three
@@ -405,6 +445,95 @@ advances 350 source samples a refill (`MJPEG_SRC_PER_VBL_MONO`).
 **Untested on an SM124**: EmuMD plays it in Hatari (`make emu MONO=1`), and
 the timing claims are md-doom's arithmetic and Hatari, not hardware.
 
+### TT and Falcon: 256 colours
+
+Ported from MD/DOOM v1.0.5 (whose detection, mode words and cache handling
+come from md-xt, MD/SuperCharger), which a real TT has played. On a TT
+(`_VDO` 2) with a colour monitor (MFP GPIP 7 high: the monitor, not the
+mode) or a Falcon (`_VDO` 3) whose `VgetMonitor` is not an SM124, with DMA
+sound and ST RAM free for two pages from `$80000` (`main.s` passes the top
+of what's free in D7: the lower of `_memtop` and TOS's screen), `userfw.s`
+switches to 8 interleaved bitplanes while TOS still runs, before its own
+VBL handler goes in. A TT runs TT Low (`$0700` to `$FF8262`) with each row
+on two lines (40..439); a Falcon gets `VsetMode` 8 planes, on VGA with
+`VERTFLAG` (320×240, rows on lines 20..219), on RGB or a TV 320×200,
+waited over two Vsyncs (TOS 4.04 writes the VIDEL a VBL after the next).
+Both are 60 Hz on VGA. The display report is `$FB9000` + 2 (TT) or + 6
+(Falcon); `fb.c` latches it (`fb_st_eight()`, `fb_st_falcon()`).
+
+**The transfer** (`cart_shared.h`, "256 colours"): 64,000 bytes a frame,
+twice the cart FB, so two parts of 100 rows, row-major, natural order, 20
+groups of 8 plane words a row (`fb_c2p8_part`, the 4-plane nibble trick for
+eight planes, both cores). The RP writes a part, the part index and, last,
+a sequence word (shared slot 3); the m68k copies a part when the sequence
+changes, up to a row budget a VBL measured at boot (`eight_calibrate`:
+rows copied in a VBL, three quarters kept, at most a part; reported at
+`$FB9400` + rows, `B` in the heartbeat), and acks it at `$FB9200` + the
+sequence's low byte, repeating that while idle. The page goes on screen
+after part 1. A frame takes two VBLs at least, and on a real TT (`B72`,
+as MD/DOOM measured) two each, four in all: 15 fps at 60 Hz is the ST's
+limit, and the RP's is lower (Known issues). So **`fb_publish()` returns
+once part 0 is posted** (MD/DOOM sends both): part 1 goes from
+`fb_pump_rom3()` as soon as part 0's ack is in, which the decode's
+`mjpeg_service()` calls every band, so the next frame's decode overlaps
+part 0's copy (~30 ms on a TT) rather than `fb_publish` waiting it out.
+Until part 1 has gone, rows 100..199 of the chunked buffer are still the
+last frame's, so **anything that draws calls `fb_publish_wait_rows()`
+first**: `mq_draw8` with each band's last row (it sends part 1, waiting
+for the ack if it must, when the decode reaches row 100),
+`decode_frame` after the decode (in case it stopped short), the paused
+frame and the menu. Changing the palette waits the same way
+(`fb_eight_set_colour`), as does the next `fb_publish`: the m68k reads
+the palette as it starts a part 0, which part 1's going proves it has.
+A new drawing path in 256 colours must do the same.
+The copy (`copy_row8`, MOVEMs of 40 bytes, a TT's doubled line from the
+same registers) is copied at boot to `$71900` and run from there: the
+cartridge is cache-inhibited on a TT, so from there every instruction would
+be another cartridge read, and from ST RAM a 68030 caches it. **The
+16-colour loop is untouched**: 256 colours has a loop of its own
+(`.vbl8_loop`), chosen once at boot, which shares `.after_copy`'s reports
+and DMA refill and branches out of the refill to `.vbl8_copy`, so the YM
+path runs exactly the instructions it did — a plain ST has no cycles to
+spare (three tests of `UFW_EIGHT` there dropped it from 150 refills in 3 s
+to 110). It polls the keyboard after every row and while it waits for the
+VBL (`IKBD_POLL`): it doesn't run `FBDRV_INLINE`, whose poll the 16-colour
+picture relies on. State is in page A, which this mode doesn't show
+(`UFW8_STATE`, `$71000`), and its pages at `$80000` and `$80000 +
+153,600` (TT) or `+ 76,800` (Falcon) are cleared at boot.
+
+**The palette** is 256 entries at `$FA4504` (APP_FREE's start), in the
+registers' own format so the m68k only copies it: a TT's words, a
+Falcon's `$FF9800` longs, which MD/DOOM squeezes into words and expands,
+leaving blue 4 bits (white comes out (255,255,243)). The RP writes it in
+place between publishes and bumps slot 4 with part 0 when it changed; the
+m68k latches it at the start of part 0 and applies it at the VBL the page
+goes on screen. Entries 0..15 follow `palette_set` (`fb_eight_st_palette`),
+so the menu, the time overlay and the boot screen draw as they do in 16
+colours; `fb_eight_set_colour` sets the rest.
+
+**The quantizer** (`mjpeg_quant.c`, "256 colours"; `mq_eight()` chooses
+it at `mq_init`, and `decode_frame` re-inits it if the report came later):
+pens 0..15 a grey ramp (so pens 0 and 15 are black and white for the
+overlay and the menu over the video, and `mq_republish` does nothing), and
+240 of the frame's own. Blue noise to RGB444, a 4096-bin histogram, a
+4096-entry map; median cut to 240 boxes, splitting the box with the most
+pixels times its longest side, each box also keeping its partition of the
+cube so the map comes from the cut (no nearest search, which 4096 × 240
+would make too slow); entries sorted darkest first. No hysteresis or
+saturation boost. Its tables (~21 KB) and the deeper PCM ring live in
+`fb_eight_scratch()`, the planar scratch, which nothing touches once
+`fb_st_eight()` is latched. **A frame goes out with the palette its
+pixels were mapped through**: `mq8_frame_done` commits the pending palette
+first, then cuts the next one — unlike the 16 colours, which publish the
+new palette with the frame it came from (harmless there: sorted and
+slewed; here the box order changes every frame).
+
+Leaving through `CMD_BOOT_GEM` puts TOS's 256 colours back, the TT's shift
+mode and the Falcon's `VsetMode` word. **Works on a real TT** (v1.2.0, 13
+Nov 2026); **untested on a real Falcon**. Checked in
+Hatari (TOS 3.06 and EmuTOS 1.4 on a TT, TOS 4.04 on a Falcon on VGA, RGB
+and mono), with the 16-colour machines (ST, STE, STE mono) unchanged.
+
 ### Audio pipeline
 
 RP fills a 1 KB cart buffer (`$FA4100`) with (vA, vB) YM volume pairs each
@@ -454,8 +583,28 @@ buzzes:
   same timer on Core 0 stalling compute for 100–200 ms at a time — keep it
   on Core 1.
 
-The heartbeat's `A` (refills since the last line: ~150, ~214 in mono) and
-`L` (the refill size, i.e. the DMA length it settled on) show it working.
+**Ported from MD/DOOM v1.0.3 in v1.2.0**, for the TT and the Falcon
+(found in Hatari, before 256 colours went in):
+- **The DMA length's starting point is measured at boot** (`snd_measure`:
+  4 KB of silence played once from page A, the frame counter read four
+  VBLs apart), not guessed at 500 (350 in mono). A TT's or a Falcon's VGA
+  monitor runs at 60 Hz, ~417 bytes a VBL, and the steer takes any drift
+  over 64 for a buffer handover and ignores it, so a TT sat at `L500`:
+  sound and video ~20% fast. It settles at 417 there, 501 on an STE, 351
+  in mono.
+- **A Falcon routes its sound frames to Timer-A only if bit 2 of
+  `$FF8900` says so** (`SND_INT_CTRL`), and TOS 4.04 leaves it clear:
+  `userfw_snd_irq` never ran, the chip looped on buffer A and the length
+  steered itself to the floor. Set when `_SND` has bit 2, put back on exit.
+- **On a 68020/030 the data cache is off** while userfw runs, instruction
+  cache on (`caches_off`, CACR `$0809`); a 68040/060 both off. A cartridge
+  read the cache answered would never reach the RP. TOS 3.06's PMMU makes
+  the cartridge cache-inhibited on a TT, but nothing promises it of TOS 4.
+  TOS's CACR goes back on exit.
+
+The heartbeat's `A` (refills since the last line: ~150, ~214 in mono,
+~180 at 60 Hz) and `L` (the refill size, i.e. the DMA length it settled
+on) show it working.
 On the YM path the refill lands while Timer-B is near the end of the
 buffer, so the last few samples of a VBL come from the next one (MD/DOOM
 has the same, as a known issue).
@@ -502,12 +651,12 @@ Offsets are defined in `rp/src/include/cart_shared.h` (RP) and
 | `$FA0000` | cartridge image | 16 KB | m68k header + main.s + userfw.s (read-only from m68k) |
 | `$FA4000` | `CMD_MAGIC_SENTINEL` | 4 B | RP→m68k command word (ESC exit etc.) |
 | `$FA400C` | `FB_FRAME_COUNTER` | 4 B | RP-incremented dirty-frame counter |
-| `$FA4010` | `SHARED_VARIABLES` | 240 B | 60 × 4 B slots |
+| `$FA4010` | `SHARED_VARIABLES` | 240 B | 60 × 4 B slots: slot 3 the 256-colour part sequence and index, slot 4 its palette's sequence |
 | `$FA4040` | `PALETTE` | 32 B | 16 ST palette words, applied by m68k every VBL |
 | `$FA4100` | `AUDIO_BUFFER` | 1 KB | YM sample pairs |
 | `$FA4500` | `SPEAKER` | 2 B | the menu's TT speaker setting (0 off, 1 on), see "TT speaker" |
-| `$FA4502` | `APP_FREE` | ~15.5 KB | free arena |
-| `$FA8300` | `FRAMEBUFFER` | 32 000 B | 320×200×4bpp planar FB (640×400×1bpp in mono), chunk-reversed for the MOVEM copy |
+| `$FA4502` | `APP_FREE` | ~15.5 KB | free arena; its first 1 KB, from `$FA4504`, is the 256-colour palette (TT words or Falcon longs) |
+| `$FA8300` | `FRAMEBUFFER` | 32 000 B | 320×200×4bpp planar FB (640×400×1bpp in mono), chunk-reversed for the MOVEM copy; in 256 colours one part, 100 rows of 8 planes in natural order |
 
 The m68k cannot write the region, so it talks to the RP by **reading** ROM3
 (`$FB0000`–`$FBFFFF`); commemul captures the low 16 address bits and
@@ -517,10 +666,12 @@ The m68k cannot write the region, so it talks to the RP by **reading** ROM3
 | --- | --- |
 | `$FB8200 + byte` | IKBD byte (`ikbd.c`) |
 | `$FB8400` | frame ack: the copy is done, the cart FB may be rewritten (in mono only on the VBL that ends a frame); refills the audio |
-| `$FB8401` | mono, the VBL after a frame's first half: refills the audio, but not a frame ack |
+| `$FB8401` | mono, the VBL after a frame's first half, and every VBL in 256 colours: refills the audio, but not a frame ack |
 | `$FB8600 + cap` | sound capability, every VBL: bit 0 STE DMA (else YM), bit 1 a TT (see "TT speaker") |
 | `$FB8C00 + len - 320` | STE DMA sound: the bytes the chip eats per VBL, as measured (every VBL) |
-| `$FB9000 + mono` | display, every VBL (1 = ST high res) |
+| `$FB9000 + display` | display, every VBL: 1 ST high res, 2 a TT in 256 colours, 6 a Falcon in 256 colours |
+| `$FB9200 + seq` | 256 colours: the part with that sequence (low byte) is copied, the cart FB is free; repeated every idle VBL |
+| `$FB9400 + rows` | 256 colours: the rows of a part the m68k copies a VBL, measured at boot (every VBL) |
 
 Odd low bytes do reach the RP: the IKBD window and the `+ 1` reports depend
 on it.
@@ -575,6 +726,9 @@ of the template's platform guide) was removed as an upstream duplicate.
 | STE DMA: sound stops for ~2:48 then returns, or ~1 s bursts of noise | The DMA's START/END written outside `userfw_snd_irq` (see "Audio pipeline") |
 | STE DMA: a crackle every few seconds | The DMA length not steered, or the RP not producing `L` bytes; check `L` in the heartbeat moves off 500 |
 | Audio crackle/dropouts every ~0.5 s | PCM ring underrun — check `R` in heartbeat, see lesson 8 |
+| Picture frozen, sound playing on, `S` climbing and `R` full | The PCM ring ran dry once too often (Known issues); a seek recovers it |
+| TT or Falcon in 16 colours | The About page's VIDEO line says which picture the ST reported. 256 colours needs a colour monitor, DMA sound and RAM for two pages above `$80000` (D7 from `main.s`) |
+| TT/Falcon 256 colours: TT Low or the 8-plane mode with garbage, or a stale picture | A 68030's data cache answering cartridge reads (`caches_off`), or the part protocol: check `B` in the heartbeat is non-zero |
 | Choppy video, many skips | Decode over 40 ms/frame — re-encode at higher `-q` (speed dial), see encoding contract |
 | `the input device is not a TTY` from stcmd | Export `STCMD_NO_TTY=1` (build scripts already do) |
 | Harmless VASM warnings (`target data type overflow`) | Ignore |
@@ -593,6 +747,23 @@ of the template's platform guide) was removed as an upstream duplicate.
   from the AVI's rate (`arate` / VBL rate) and resample to the output count
   on both paths; until then, encode with `STE=1`.
 - **ST high res is untested on an SM124** (see "ST high res").
+- **256 colours plays at ~12.5 fps on a real TT** (v1.2.0 debug build,
+  BBB trailer, 13 Nov 2026): `B72`, `L420`, `A` ~182 per 3 s, `E0`, `F`
+  +34-43 per 3 s (half the frames shown), ~80 ms a frame: the decode (`D`
+  55-79 ms, now including any wait at row 100) + the 240-colour cut (`Q`
+  6.3-8.8 ms). An earlier build, which waited for part 0's ack inside
+  `fb_publish`, managed ~9 (`F` +27, ~105 ms a frame, `D` 55-72 ms). The
+  RP is still the limit, not the ST (a frame every four VBLs, 15 fps).
+  Further ways up: a higher encoding q (~40 ms decodes at q11 would reach
+  the ST's 15), a faster cut (~1 fps). **Untested on a real Falcon**; its
+  copy rate is unknown.
+- **A PCM ring that runs dry desyncs for good.** `mjpeg_audio_fill()`
+  counts silence as time (so a file with no audio still plays), so audio
+  that arrives late stays late, and the demuxer can't catch up: it is held
+  to real time by the full ring. Past the ring plus two frames every frame
+  is late and the picture freezes while the sound plays on, until a seek
+  (which resets the clock). The rings are sized so the decode can't empty
+  them (lesson 8); a stall of the main loop longer than that would.
 - **`_` is blank in `font8x8.h`**, so underscores in file names show as
   spaces in the menu.
 

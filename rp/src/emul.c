@@ -175,7 +175,7 @@ void emul_start() {
         uint32_t now = time_us_32();
         if (now - hb_us > 3000000u) { /* UART liveness heartbeat */
           hb_us = now;
-          static char dbg[64];
+          static char dbg[96];
           mjpeg_debug_status(dbg, sizeof(dbg));
           DPRINTF("HB: %s\n", dbg);
         }

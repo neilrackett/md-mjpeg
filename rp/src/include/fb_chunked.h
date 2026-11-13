@@ -117,6 +117,20 @@ void fb_transpose_mono(const uint8_t levels[16]);
 void fb_mono_rows(uint16_t *scratch, unsigned y0, unsigned y1,
                   const uint8_t levels[16]);
 
+/* 256 colours (cart_shared.h): rows part * 100 .. part * 100 + 99 of the
+ * chunked buffer, whole bytes as palette indices, to 8 interleaved
+ * planes straight into `cart_fb` (the cart FB, which the caller has
+ * made sure the m68k is not reading). Each 16 pixels make 8 words,
+ * plane 0 first, the leftmost pixel in bit 15, in natural row order.
+ * Dual-core, like fb_transpose(). */
+void fb_c2p8_part(uint16_t *cart_fb, unsigned part);
+
+/* The planar scratch, which only the 16-colour and mono pictures use:
+ * CART_FRAMEBUFFER_SIZE bytes, 4-byte aligned. Once fb_st_eight() is
+ * true (it is latched) nothing here touches it again, and an app drawing
+ * in 256 colours may keep its own tables there. */
+uint8_t *fb_eight_scratch(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -343,6 +343,9 @@ static void draw_about(const struct menu_style *st) {
       menu_centred(st, y++, "SOUND: DETECTING");
       break;
   }
+  menu_centred(st, y++, fb_st_eight()  ? "VIDEO: 256 COLOURS"
+                        : fb_st_mono() ? "VIDEO: MONO"
+                                       : "VIDEO: 16 COLOURS");
 
   menu_centred(st, MENU_ROWS - 1, "PRESS ANY KEY");
 }
@@ -426,6 +429,8 @@ int mjpeg_menu_key(uint8_t scancode) {
 }
 
 void mjpeg_menu_render(void) {
+  /* 256 colours: the last frame sent whole before drawing over it. */
+  fb_publish_wait_rows(FB_CHUNKED_H);
   /* After a video ends (mjpeg_finish) its last frame stays behind the
    * menu, in its own palette, as the menu over a playing video does. */
   if (mjpeg_menu_shown()) {

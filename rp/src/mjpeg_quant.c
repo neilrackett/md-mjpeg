@@ -43,6 +43,9 @@
 
 #include <string.h>
 
+#include "bluenoise.h" /* const 32x32 level matrix, lives in flash */
+#include "cart_shared.h"
+#include "fb.h"
 #include "fb_chunked.h"
 #include "mjpeg.h"
 #include "palette.h"
@@ -62,7 +65,6 @@
 #endif
 
 #if MQ_DITHER_BLUENOISE
-#include "bluenoise.h" /* const 32x32 level matrix, lives in flash */
 #define MQ_DITHER_N 16 /* blue noise quantizes to 16 threshold levels */
 #else
 #define MQ_DITHER_N 4  /* 2x2 Bayer: 4 tile positions / threshold levels */
@@ -256,9 +258,26 @@ static void publish_and_map(void) {
   pal_b[last] = keep[2];
 }
 
-void mq_republish(void) { publish_and_map(); }
+/* 256 colours (at the end of this file): chosen by mq_init when the ST
+ * shows them, and then the only quantizer in use until the next. */
+static bool s_eight;
+static void mq8_init(void);
+static void mq8_frame_done(void);
+
+bool mq_eight(void) { return s_eight; }
+
+void mq_republish(void) {
+  /* 256 colours: pens 0 and 15 are black and white anyway. */
+  if (!s_eight) publish_and_map();
+}
 
 void mq_init(void) {
+  s_eight = fb_st_eight();
+  if (s_eight) {
+    mq8_init();
+    return;
+  }
+
   /* Ordered dither: out = floor(c/cmax * 7 + (2*level+1)/2N), i.e. the
    * N = MQ_DITHER_N normalized thresholds are (level+0.5)/N. Integer
    * form: (c*7*2N + (2*level+1)*cmax) / (cmax*2N). For Bayer, the LUT
@@ -503,6 +522,10 @@ static void boost_entry(uint8_t *pr, uint8_t *pg, uint8_t *pb) {
 #endif
 
 void mq_frame_done(void) {
+  if (s_eight) {
+    mq8_frame_done();
+    return;
+  }
   box_t boxes[PALETTE_ENTRIES];
   boxes[0] = (box_t){0, 7, 0, (uint8_t)MQ_GMAX, 0, 7, 0};
   box_shrink(&boxes[0]);
@@ -669,4 +692,348 @@ void mq_frame_done(void) {
 
   publish_and_map();
   memset(hist, 0, sizeof(hist));
+}
+
+/* --- 256 colours ------------------------------------------------
+ *
+ * A TT or a Falcon with a colour monitor (fb_st_eight): 256 colours from
+ * a TT's 4096 or a Falcon's 262,144. Entries 0..15 are fb.c's from
+ * palette_set, held at a grey ramp from black to white so that the time
+ * overlay and the menu over the video have their pens 0 and 15; the
+ * other 240 are the frame's own. The same model as the 16 colours: the
+ * pixels are blue-noise dithered, here to RGB444 (a TT's own depth),
+ * counted in a 4096-bin histogram and mapped through a table, and after
+ * the frame the histogram is median-cut into the next frame's palette.
+ *
+ * Differences, for 240 colours rather than 15:
+ *  - The map comes from the cut itself, not a nearest-colour search
+ *    (4096 x 240 would take too long): each box also keeps the share of
+ *    the whole RGB444 cube it was cut from, its partition, and every
+ *    bin in that maps to the box -- including bins this frame did not
+ *    use, which the next one may.
+ *  - The box split next is the one with the most pixels times its
+ *    longest side, a stand-in for the most error; with 240 boxes the
+ *    pixel count alone spends them on big flat areas.
+ *  - No hysteresis and no saturation boost. A box's colours are close
+ *    together, so its centroid isn't washed out, and the entries aren't
+ *    sorted, so there is nothing to slew from frame to frame.
+ *  - A frame goes out with the palette its pixels were mapped through.
+ *    The 16-colour palettes are luminance-sorted and slewed, so sending
+ *    the new one with the frame it came from does no harm; these are
+ *    neither, so mq8_frame_done keeps the new palette pending and
+ *    commits it (fb_eight_set_colour) with the next frame, the first to
+ *    be mapped through it.
+ *
+ * Its tables (~19 KB) live in fb_eight_scratch(): RAM the 16-colour
+ * picture needs and this one doesn't, and there is none to spare. */
+
+#define MQ8_FIXED 16u                      /* entries 0..15: palette_set's */
+#define MQ8_COLOURS (256u - MQ8_FIXED)     /* 240: the frame's own        */
+#define MQ8_BINS 4096u                     /* RGB444: r << 8 | g << 4 | b */
+#define MQ8_GREY_STEP 17u                  /* a 4-bit level as 8 bits    */
+
+typedef struct {
+  uint8_t lo[3], hi[3];   /* the occupied bins, r g b, inclusive        */
+  uint8_t plo[3], phi[3]; /* its partition of the cube, likewise         */
+  uint32_t cnt;
+  uint32_t score;         /* cnt x longest side; 0 = one bin, can't split */
+} box8_t;
+
+typedef struct {
+  uint16_t hist[MQ8_BINS];
+  uint8_t map[MQ8_BINS];            /* bin -> palette index, 16..255      */
+  uint16_t lutR[16][32];            /* 5-bit red -> 4 bits, << 8          */
+  uint8_t lutG[16][64];             /* 6-bit green -> 4 bits, << 4        */
+  uint8_t lutB[16][32];             /* 5-bit blue -> 4 bits               */
+  uint8_t pending[MQ8_COLOURS][3];  /* the next frame's palette, 8-bit RGB */
+  box8_t boxes[MQ8_COLOURS];
+  uint8_t cent[MQ8_COLOURS][3];     /* each box's mean colour, 8-bit RGB  */
+  uint16_t key[MQ8_COLOURS];        /* its luminance, for the sort        */
+  uint8_t order[MQ8_COLOURS];       /* the boxes, darkest first           */
+} mq8_t;
+
+/* What the tables leave of the scratch goes to the player (mq_eight_spare). */
+#define MQ8_USED ((sizeof(mq8_t) + 3u) & ~3u)
+_Static_assert(MQ8_USED <= CART_FRAMEBUFFER_SIZE, "the 256-colour tables outgrow the scratch");
+
+static mq8_t *q8;
+
+uint8_t *mq_eight_spare(uint32_t *bytes) {
+  if (!s_eight) {
+    *bytes = 0;
+    return NULL;
+  }
+  *bytes = CART_FRAMEBUFFER_SIZE - MQ8_USED;
+  return fb_eight_scratch() + MQ8_USED;
+}
+
+/* Index strides of r, g and b in a bin. */
+static const uint16_t kStride8[3] = {256u, 16u, 1u};
+
+/* Each entry's colour now, for the next frame, and the map to match: a
+ * 6 x 8 x 5 cube, until the first frame has its own. */
+static void mq8_cube(void) {
+  for (unsigned r = 0; r < 6u; r++) {
+    for (unsigned g = 0; g < 8u; g++) {
+      for (unsigned b = 0; b < 5u; b++) {
+        uint8_t *p = q8->pending[(r * 8u + g) * 5u + b];
+        p[0] = (uint8_t)(r * 255u / 5u);
+        p[1] = (uint8_t)(g * 255u / 7u);
+        p[2] = (uint8_t)(b * 255u / 4u);
+      }
+    }
+  }
+  for (unsigned c = 0; c < MQ8_BINS; c++) {
+    const unsigned r = ((c >> 8) * 5u + 7u) / 15u;
+    const unsigned g = (((c >> 4) & 15u) * 7u + 7u) / 15u;
+    const unsigned b = ((c & 15u) * 4u + 7u) / 15u;
+    q8->map[c] = (uint8_t)(MQ8_FIXED + (r * 8u + g) * 5u + b);
+  }
+}
+
+static void mq8_commit(void) {
+  for (unsigned i = 0; i < MQ8_COLOURS; i++) {
+    const uint8_t *p = q8->pending[i];
+    fb_eight_set_colour(MQ8_FIXED + i, p[0], p[1], p[2]);
+  }
+}
+
+static void mq8_init(void) {
+  q8 = (mq8_t *)fb_eight_scratch();
+  /* The same dither as the 16 colours' blue noise (see mq_init), to 15
+   * steps instead of 7. */
+  for (unsigned l = 0; l < 16u; l++) {
+    const unsigned t = 2u * l + 1u;
+    for (unsigned c = 0; c < 32u; c++) {
+      const unsigned v = (c * 15u * 32u + t * 31u) / (31u * 32u);
+      q8->lutR[l][c] = (uint16_t)(v << 8);
+      q8->lutB[l][c] = (uint8_t)v;
+    }
+    for (unsigned c = 0; c < 64u; c++) {
+      const unsigned v = (c * 15u * 32u + t * 63u) / (63u * 32u);
+      q8->lutG[l][c] = (uint8_t)(v << 4);
+    }
+  }
+  uint16_t grey[PALETTE_ENTRIES];
+  for (unsigned i = 0; i < PALETTE_ENTRIES; i++) {
+    grey[i] = PALETTE_STE_RGB(i, i, i);
+  }
+  palette_set(grey);
+  mq8_cube();
+  mq8_commit();
+  memset(q8->hist, 0, sizeof(q8->hist));
+}
+
+int __not_in_flash_func(mq_draw8)(JPEGDRAW *pDraw) {
+  mq8_t *const q = q8;
+  /* The decode runs top down while the last frame's bottom half waits to
+   * go: it goes, now if not before, as the decode reaches it. */
+  fb_publish_wait_rows((unsigned)(pDraw->y + pDraw->iHeight));
+  int w = pDraw->iWidthUsed > 0 ? pDraw->iWidthUsed : pDraw->iWidth;
+  int x0 = pDraw->x;
+  if (x0 < FB_CHUNKED_W) {
+    if (x0 + w > FB_CHUNKED_W) {
+      w = FB_CHUNKED_W - x0;
+    }
+    for (int row = 0; row < pDraw->iHeight; row++) {
+      int y = pDraw->y + row;
+      if (y >= FB_CHUNKED_H) {
+        break;
+      }
+      const uint16_t *s = pDraw->pPixels + (uint32_t)row * pDraw->iWidth;
+      uint8_t *d = fb_chunked_buffer + (uint32_t)y * FB_CHUNKED_W + x0;
+      const uint8_t *nz =
+          &bluenoise[(unsigned)(y & (BLUENOISE_N - 1)) * BLUENOISE_N];
+      int i = 0;
+      for (; i + 3 < w; i += 4) {
+        unsigned l0 = nz[(unsigned)(x0 + i) & (BLUENOISE_N - 1)];
+        unsigned l1 = nz[(unsigned)(x0 + i + 1) & (BLUENOISE_N - 1)];
+        unsigned l2 = nz[(unsigned)(x0 + i + 2) & (BLUENOISE_N - 1)];
+        unsigned l3 = nz[(unsigned)(x0 + i + 3) & (BLUENOISE_N - 1)];
+        uint32_t p0 = s[i], p1 = s[i + 1], p2 = s[i + 2], p3 = s[i + 3];
+        unsigned c0 = q->lutR[l0][(p0 >> 11) & 31] | q->lutG[l0][(p0 >> 5) & 63] | q->lutB[l0][p0 & 31];
+        unsigned c1 = q->lutR[l1][(p1 >> 11) & 31] | q->lutG[l1][(p1 >> 5) & 63] | q->lutB[l1][p1 & 31];
+        unsigned c2 = q->lutR[l2][(p2 >> 11) & 31] | q->lutG[l2][(p2 >> 5) & 63] | q->lutB[l2][p2 & 31];
+        unsigned c3 = q->lutR[l3][(p3 >> 11) & 31] | q->lutG[l3][(p3 >> 5) & 63] | q->lutB[l3][p3 & 31];
+        q->hist[c0]++;
+        q->hist[c1]++;
+        q->hist[c2]++;
+        q->hist[c3]++;
+        d[i] = q->map[c0];
+        d[i + 1] = q->map[c1];
+        d[i + 2] = q->map[c2];
+        d[i + 3] = q->map[c3];
+      }
+      for (; i < w; i++) {
+        unsigned l = nz[(unsigned)(x0 + i) & (BLUENOISE_N - 1)];
+        uint32_t p = s[i];
+        unsigned c = q->lutR[l][(p >> 11) & 31] | q->lutG[l][(p >> 5) & 63] | q->lutB[l][p & 31];
+        q->hist[c]++;
+        d[i] = q->map[c];
+      }
+    }
+  }
+  mjpeg_service(); /* audio + IKBD stay alive during the decode */
+  return 1;
+}
+
+/* Tighten a box to its occupied bins and recount it. */
+static void box8_shrink(box8_t *bx) {
+  unsigned lo[3] = {15, 15, 15}, hi[3] = {0, 0, 0};
+  uint32_t cnt = 0;
+  for (unsigned r = bx->lo[0]; r <= bx->hi[0]; r++) {
+    for (unsigned g = bx->lo[1]; g <= bx->hi[1]; g++) {
+      const uint16_t *line = &q8->hist[(r << 8) | (g << 4)];
+      for (unsigned b = bx->lo[2]; b <= bx->hi[2]; b++) {
+        const uint32_t n = line[b];
+        if (n) {
+          cnt += n;
+          if (r < lo[0]) lo[0] = r;
+          if (r > hi[0]) hi[0] = r;
+          if (g < lo[1]) lo[1] = g;
+          if (g > hi[1]) hi[1] = g;
+          if (b < lo[2]) lo[2] = b;
+          if (b > hi[2]) hi[2] = b;
+        }
+      }
+    }
+  }
+  bx->cnt = cnt;
+  bx->score = 0;
+  if (cnt) {
+    unsigned side = 0;
+    for (unsigned a = 0; a < 3u; a++) {
+      bx->lo[a] = (uint8_t)lo[a];
+      bx->hi[a] = (uint8_t)hi[a];
+      if (hi[a] - lo[a] > side) side = hi[a] - lo[a];
+    }
+    bx->score = cnt * side;
+  }
+}
+
+/* The pixels of a box at value v of axis a. */
+static uint32_t box8_slice(const box8_t *bx, unsigned a, unsigned v) {
+  const unsigned a1 = a == 0u ? 1u : 0u, a2 = a == 2u ? 1u : 2u;
+  const uint16_t *base = &q8->hist[v * kStride8[a]];
+  uint32_t n = 0;
+  for (unsigned i = bx->lo[a1]; i <= bx->hi[a1]; i++) {
+    for (unsigned j = bx->lo[a2]; j <= bx->hi[a2]; j++) {
+      n += base[i * kStride8[a1] + j * kStride8[a2]];
+    }
+  }
+  return n;
+}
+
+static void mq8_frame_done(void) {
+  /* This frame was mapped through the pending palette: it goes out with
+   * it. What follows is for the next one. */
+  mq8_commit();
+
+  box8_t *const boxes = q8->boxes;
+  boxes[0] = (box8_t){{0, 0, 0}, {15, 15, 15}, {0, 0, 0}, {15, 15, 15}, 0, 0};
+  box8_shrink(&boxes[0]);
+  if (boxes[0].cnt == 0) {
+    return; /* nothing decoded; keep the palette and the map */
+  }
+
+  unsigned nb = 1;
+  while (nb < MQ8_COLOURS) {
+    int bi = -1;
+    uint32_t best = 0;
+    for (unsigned i = 0; i < nb; i++) {
+      if (boxes[i].score > best) {
+        best = boxes[i].score;
+        bi = (int)i;
+      }
+    }
+    if (bi < 0) {
+      break; /* every box is one bin */
+    }
+    box8_t *bx = &boxes[bi];
+    /* Its longest side, green first on a tie, then red. */
+    const unsigned lr = (unsigned)(bx->hi[0] - bx->lo[0]);
+    const unsigned lg = (unsigned)(bx->hi[1] - bx->lo[1]);
+    const unsigned lb = (unsigned)(bx->hi[2] - bx->lo[2]);
+    const unsigned a = (lg >= lr && lg >= lb) ? 1u : (lr >= lb ? 0u : 2u);
+    /* Weighted median: cut after the slice that crosses half the
+     * pixels, keeping both halves non-empty (cut < hi). */
+    const uint32_t half = bx->cnt / 2u;
+    uint32_t acc = 0;
+    unsigned cut = bx->lo[a];
+    for (unsigned v = bx->lo[a]; v < bx->hi[a]; v++) {
+      acc += box8_slice(bx, a, v);
+      cut = v;
+      if (acc >= half) {
+        break;
+      }
+    }
+    box8_t upper = *bx;
+    bx->hi[a] = bx->phi[a] = (uint8_t)cut;
+    upper.lo[a] = upper.plo[a] = (uint8_t)(cut + 1u);
+    box8_shrink(bx);
+    box8_shrink(&upper);
+    boxes[nb++] = upper;
+  }
+
+  /* Each box's pixels' mean colour, and its luminance (the 16 colours'
+   * 3:6:1). */
+  for (unsigned i = 0; i < nb; i++) {
+    const box8_t *bx = &boxes[i];
+    uint32_t sum[3] = {0, 0, 0};
+    for (unsigned r = bx->lo[0]; r <= bx->hi[0]; r++) {
+      for (unsigned g = bx->lo[1]; g <= bx->hi[1]; g++) {
+        const uint16_t *line = &q8->hist[(r << 8) | (g << 4)];
+        for (unsigned b = bx->lo[2]; b <= bx->hi[2]; b++) {
+          const uint32_t n = line[b];
+          sum[0] += n * r;
+          sum[1] += n * g;
+          sum[2] += n * b;
+        }
+      }
+    }
+    const uint32_t cnt = bx->cnt ? bx->cnt : 1u;
+    uint8_t *c = q8->cent[i];
+    for (unsigned k = 0; k < 3u; k++) {
+      c[k] = (uint8_t)((sum[k] * MQ8_GREY_STEP + cnt / 2u) / cnt);
+    }
+    q8->key[i] = (uint16_t)(3u * c[0] + 6u * c[1] + c[2]);
+  }
+
+  /* Darkest first, as the 16 colours are sorted: the palette is then much
+   * the same from one frame to the next index for index (a title card's
+   * white is its last entry every time), so a frame shown for a VBL with
+   * its neighbour's palette shows near enough the same colours. Hatari
+   * does that on every flip (it draws a TT's or a Falcon's screen from
+   * the base as it stands at the VBL), and a cut's first frame is mapped
+   * through the last scene's boxes anyway. */
+  uint8_t *const order = q8->order;
+  for (unsigned i = 0; i < nb; i++) {
+    const unsigned k = q8->key[i];
+    int j = (int)i - 1;
+    while (j >= 0 && q8->key[order[j]] > k) {
+      order[j + 1] = order[j];
+      j--;
+    }
+    order[j + 1] = (uint8_t)i;
+  }
+
+  for (unsigned n = 0; n < nb; n++) {
+    const box8_t *bx = &boxes[order[n]];
+    memcpy(q8->pending[n], q8->cent[order[n]], 3);
+    /* And every bin of its partition maps to it. */
+    const uint8_t idx = (uint8_t)(MQ8_FIXED + n);
+    for (unsigned r = bx->plo[0]; r <= bx->phi[0]; r++) {
+      for (unsigned g = bx->plo[1]; g <= bx->phi[1]; g++) {
+        memset(&q8->map[(r << 8) | (g << 4) | bx->plo[2]], idx,
+               (size_t)(bx->phi[2] - bx->plo[2]) + 1u);
+      }
+    }
+  }
+  /* A frame of fewer colours leaves entries over: the brightest again,
+   * as the 16 colours do, so that the next frame's (with more, say, as a
+   * title fades in) has its brightest about where this one has. */
+  for (unsigned n = nb; n < MQ8_COLOURS; n++) {
+    memcpy(q8->pending[n], q8->pending[nb - 1u], 3);
+  }
+  memset(q8->hist, 0, sizeof(q8->hist));
 }
