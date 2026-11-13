@@ -464,11 +464,14 @@ has the same, as a known issue).
 
 Ported from MD/Speccy. On a TT only, the menu has a **TT SPEAKER** row
 (OFF, the default, or ON; Left/Right set it, Return toggles it) for the
-TT's internal speaker. Its enable is bit 6 of the YM's port A, **active
-low**: the TT030 Hardware Reference Manual's port A table reads
-"*Speaker Disable (0 disables internal speaker)" (Hatari doesn't emulate
-the speaker, and EmuTOS boots a TT with it clear). Don't reuse this on a
-Falcon without checking its polarity.
+TT's internal speaker.
+**Setting bit 6 of the YM's port A switches it off**; TOS leaves the
+bit clear, with the speaker on. That is the SidecarTridge Booster's
+polarity (`rp2-booster-bootloader`, `term/atarist/src/main.s`), and a
+real TT confirmed it: before v1.1.3 this had it the other way round,
+so the default, off, left the speaker on. Hatari doesn't emulate the
+speaker, so only hardware can tell. Don't reuse this on a Falcon
+without checking its polarity.
 
 - `userfw.s` finds a TT from `_MCH` (high word 2) through `ufw_cookie`
   (shared with the `_SND` lookup) and reports it as bit 1 of SNDCAP;
